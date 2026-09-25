@@ -7,6 +7,13 @@ in order, on a GPU machine (Colab / Kaggle / AWS), and read each script's own mo
 what it does and does not verify. Several places are flagged in code comments as
 "NEEDS GPU-MACHINE VERIFICATION" -- treat those as a checklist, not an afterthought.
 
+**Prefer a notebook?** `notebooks/run_pipeline_colab_kaggle.ipynb` runs every step below,
+block by block, in a Colab- or Kaggle-ready notebook -- it shells out to the same `src/` scripts
+(nothing is reimplemented inline), plus cells for cloning the repo, providing the dataset,
+peeking at intermediate output between stages, and packaging the final submission zip. The
+command-by-command version below is the same run order, for anyone who'd rather work from a
+terminal or a different GPU host (e.g. AWS).
+
 ## Layout
 
 This folder (`code/business_entity_resolution/`) is a self-contained copy of the pipeline, matching
