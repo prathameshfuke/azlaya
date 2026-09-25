@@ -103,7 +103,6 @@ def split_dba(raw_name: str) -> Tuple[str, str, bool]:
 
 # ------------------------------------------------------------------------------- name normalizer
 
-_PUNCT_RE = re.compile(r"[^\w\s&]", flags=re.UNICODE)
 _AMP_RE = re.compile(r"&")
 
 
@@ -112,7 +111,7 @@ def normalize_name_core(raw: str, country: str) -> str:
         return ""
     text = raw.lower()
     text = _AMP_RE.sub(" and ", text)
-    text = _PUNCT_RE.sub(" ", text)
+    text = common.strip_punctuation(text)
     text = common.collapse_ws(text)
     text = expand_legal_suffixes(text, country)
     text = common.collapse_ws(text)
@@ -168,22 +167,36 @@ def extract_postal_code(address: str) -> str:
     return matches[-1] if matches else ""
 
 
+_DIGITS_RE = re.compile(r"\d+")
+
+
 def guess_city(address_norm: str, pin_code: str) -> str:
     """Best-effort heuristic, NOT a gazetteer lookup (none is available/allowed for this
-    challenge): addresses conventionally read "..., city, state pin" or "..., city pin", so take
-    the comma-separated segment immediately before the one holding the PIN code; falls back to
-    the second-to-last comma segment when no PIN was found.
-    NEEDS GPU-MACHINE VERIFICATION: print a sample of (address_norm, city_guess) pairs and
-    eyeball them before relying on this as a blocking key -- landmark-style addresses ("near SBI
-    ATM") and municipal-numbering addresses (no commas at all) will likely make this return ""
-    or a wrong token, which is acceptable (it's a secondary blocking signal, not the only one)
-    but should be confirmed on real data, not assumed from this docstring."""
+    challenge). Two address shapes are common and disagree about where the city sits relative to
+    the PIN code's own comma segment:
+      - "<street>, <city>, <state> <pin>" or "<street>, <city>, <pin>" (US/India-style): the city
+        is the segment BEFORE the one holding the pin.
+      - "<street>, <pin> <city>" (France-style, e.g. "12 Rue de Paris, 75001 Paris"): the city is
+        IN THE SAME segment as the pin, and the segment before it is the street.
+    Disambiguate with one signal: does the segment before the pin's segment look like a street
+    (starts with a number, e.g. a house/building number)? If so, prefer extracting the city out of
+    the pin's own segment; otherwise treat that previous segment as the city, as before. Falls
+    back to the second-to-last comma segment when no PIN was found. NEEDS GPU-MACHINE
+    VERIFICATION on the real data: landmark-style addresses ("near SBI ATM") and municipal-
+    numbering addresses (no commas at all) will likely still return "" or an imperfect token,
+    which is acceptable -- this is a secondary blocking signal, not the only one -- but confirm
+    the actual hit rate on real rows, not this docstring.
+    """
     segments = [s.strip() for s in address_norm.split(",") if s.strip()]
     if not segments:
         return ""
     if pin_code:
         for i, seg in enumerate(segments):
             if pin_code in seg:
+                same_segment_city = _DIGITS_RE.sub("", seg).strip()
+                prev_looks_like_street = i > 0 and bool(re.match(r"^\d", segments[i - 1]))
+                if same_segment_city and (prev_looks_like_street or i == 0):
+                    return same_segment_city
                 return segments[i - 1] if i > 0 else ""
     return segments[-2] if len(segments) >= 2 else ""
 
@@ -196,7 +209,7 @@ def normalize_address_fields(raw_address: str) -> Dict[str, str]:
     for pattern, replacement in _COMPILED_ADDRESS_ABBR:
         text = pattern.sub(replacement, text)
     # keep commas (city/state segmentation depends on them); drop other punctuation
-    text = re.sub(r"[^\w\s,]", " ", text, flags=re.UNICODE)
+    text = common.strip_punctuation(text, keep_chars=",")
     text = re.sub(r"\s*,\s*", ", ", text)
     text = common.collapse_ws(text)
     city_guess = guess_city(text, pin_code)

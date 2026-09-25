@@ -1,15 +1,21 @@
 """Shared paths, IO helpers, and scoring utilities used by every script in this pipeline.
 
-NOTE ON EXECUTION: this whole package was authored on a machine with no GPU and nothing here
-has been run or imported. It is written to be correct by inspection; the first real run of any
-of it should happen on the GPU machine (Colab/AWS), per README.md. Spot-check outputs there
-(e.g. print a normalized sample, run report_blocking_recall) before trusting the numbers.
+NOTE ON EXECUTION: authored on a machine with no GPU. The non-GPU stages (normalize/blocking/
+features/train_gbdt) have since been smoke-tested end-to-end against a small synthetic dataset
+shaped like the real challenge files, which is how the Unicode combining-mark bug in
+`strip_punctuation` below was actually caught -- static reading alone missed it. Laya fine-tuning
+and inference (laya_finetune.py's --stage train, ensemble.py/predict.py's Laya scoring) still have
+not been run anywhere; those need a real GPU and the actual competition data. Keep spot-checking
+outputs on the GPU machine (print a normalized sample, run report_blocking_recall) before trusting
+numbers on the real dataset -- a 20-row synthetic smoke test proves the code paths run and do
+something sensible, not that every heuristic is well-tuned at full scale.
 """
 from __future__ import annotations
 
 import argparse
 import random
 import re
+import unicodedata
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
 
@@ -265,3 +271,27 @@ _WS_RE = re.compile(r"\s+")
 
 def collapse_ws(text: str) -> str:
     return _WS_RE.sub(" ", text).strip()
+
+
+# Unicode general-category prefixes to KEEP when stripping punctuation: L* (letters), M* (marks --
+# combining vowel signs and the virama/halant that Devanagari, Tamil, and most other Indic/complex
+# scripts build words out of), N* (digits).
+_KEEP_CATEGORY_PREFIXES = ("L", "M", "N")
+
+
+def strip_punctuation(text: str, keep_chars: str = "") -> str:
+    """Replace every character that is not a letter/mark/digit, whitespace, or in `keep_chars`
+    with a single space.
+
+    This is deliberately NOT `re.sub(r"[^\\w\\s]", " ", text)`: Python's `\\w` matches Unicode
+    letters and digits but NOT combining marks (category Mn/Mc) -- and Devanagari/Tamil vowel
+    signs and the virama/halter are combining marks, not standalone letters. A `\\w`-based strip
+    silently deletes them, corrupting every word that uses one (i.e. most Devanagari/Tamil text)
+    into fragments -- e.g. "शर्मा" (Sharma) becomes "शर म" (this was caught by actually running
+    normalize.py against a synthetic Devanagari-name row, not by reading the regex).
+    """
+    return "".join(
+        ch if ch.isspace() or ch in keep_chars or unicodedata.category(ch).startswith(_KEEP_CATEGORY_PREFIXES)
+        else " "
+        for ch in text
+    )
