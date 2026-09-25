@@ -1,0 +1,25 @@
+# Business Entity Resolution pipeline -- pinned for the GPU machine (Colab / AWS / Kaggle).
+# Install with: pip install -r requirements.txt
+# Python 3.10+ required (laya's own floor: huggingface_hub 1.x / transformers 5.x / torch 2.14
+# all require it -- see NandhaKishorM/laya's README "Installation details").
+
+# --- normalize.py / blocking.py / features.py / train_gbdt.py ---
+pandas>=2.0,<3.0
+numpy>=1.24,<2.0
+pyarrow>=14.0            # parquet IO for the features_{split}.parquet tables
+scikit-learn>=1.3,<2.0   # TfidfVectorizer (blocking/features), LogisticRegression (ensemble)
+rapidfuzz>=3.5,<4.0      # Levenshtein / Jaro-Winkler string similarity
+lightgbm>=4.1,<5.0
+joblib>=1.3              # persists the logistic-regression stacker
+
+# --- laya_finetune.py / ensemble.py / predict.py ---
+torch>=2.2                    # match this to your CUDA build; see pytorch.org/get-started/locally
+transformers>=4.48.0
+safetensors>=0.4.0
+huggingface_hub>=0.24.0
+datasets>=3.0.0               # only needed if you adapt laya_finetune.py to pull an HF dataset
+laya>=0.3.20,<0.4.0           # convaiinnovations/laya -- Apache-2.0, 421M/322M params (<=8B, license-compliant)
+
+# Optional: train_gbdt.py is written for LightGBM (as specified). XGBoost is a documented
+# drop-in alternative (same feature table / label / split logic) if you'd rather use it instead:
+# xgboost>=2.0,<3.0
