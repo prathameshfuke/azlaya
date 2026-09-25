@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Datasets (individual files >100MB exceed GitHub's limit)
+student_resource/dataset/
+*.tsv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
