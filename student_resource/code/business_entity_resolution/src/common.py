@@ -48,6 +48,18 @@ def add_repo_root_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def require(path, produced_by: str) -> Path:
+    """Fail with a readable message when a step's input is missing, naming the earlier step that
+    writes it. Without this, a step whose predecessor crashed (e.g. out of memory) fails with a
+    bare FileNotFoundError that points at the wrong step."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} does not exist. It is written by {produced_by} -- run that step first and check "
+            f"its output for errors (a crashed earlier step is the usual cause).")
+    return path
+
+
 def dataset_dir(repo_root: Path, split: str) -> Path:
     assert split in SPLITS, split
     return Path(repo_root) / "dataset" / split
@@ -102,7 +114,8 @@ def read_source_tsv(path) -> pd.DataFrame:
 def load_split_sources(repo_root: Path, split: str) -> Dict[str, pd.DataFrame]:
     d = dataset_dir(repo_root, split)
     names = SOURCE_FILENAMES[split]
-    out = {key: read_source_tsv(d / names[key]) for key in SOURCE_KEYS}
+    out = {key: read_source_tsv(require(d / names[key], "the dataset setup (notebook Section 0.3)"))
+           for key in SOURCE_KEYS}
     if split == "train":
         out["ground_truth"] = read_source_tsv(d / names["ground_truth"])
     return out
@@ -115,7 +128,8 @@ def normalized_path(repo_root: Path, split: str, key: str) -> Path:
 
 
 def load_normalized(repo_root: Path, split: str, key: str) -> pd.DataFrame:
-    return _read_tsv_with_progress(normalized_path(repo_root, split, key))
+    return _read_tsv_with_progress(require(normalized_path(repo_root, split, key),
+                                           f"normalize.py (notebook Section 1) for --split {split}"))
 
 
 def write_normalized(df: pd.DataFrame, repo_root: Path, split: str, key: str) -> Path:

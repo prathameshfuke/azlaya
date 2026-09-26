@@ -177,7 +177,7 @@ def compute_features(pairs_df: pd.DataFrame, table: pd.DataFrame, chunk_size: in
 
 def run(repo_root, split: str, candidates_path, out_path):
     candidates_path = candidates_path or (common.output_dir(repo_root) / "candidate_pairs.tsv")
-    candidate_map = common.read_id_list_tsv(candidates_path)
+    candidate_map = common.read_id_list_tsv(common.require(candidates_path, "blocking.py (notebook Section 2)"))
     pairs_df = build_pairs_frame(candidate_map)
     print(f"[features] {split}: {len(candidate_map)} S1 entities, {len(pairs_df)} candidate pairs")
 

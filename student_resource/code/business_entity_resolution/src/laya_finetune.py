@@ -158,7 +158,7 @@ def stage_prepare(repo_root: Path, candidates_path, val_frac: float, calib_frac:
           f"{len(calib_ids)} calibration S1 entities")
 
     candidates_path = candidates_path or (common.data_processed_dir(repo_root) / "candidate_pairs_train.tsv")
-    candidate_map = common.read_id_list_tsv(candidates_path)
+    candidate_map = common.read_id_list_tsv(common.require(candidates_path, "blocking.py (notebook Section 2)"))
     lookup = load_entity_lookup(repo_root, "train")
 
     finetune_examples = build_examples(candidate_map, lookup, truth, finetune_ids, max_negatives_per_entity, seed)
@@ -290,8 +290,9 @@ def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_
     cfg["max_tokens_per_batch"] = 4096
 
     data_dir = common.data_processed_dir(repo_root)
-    train_examples = read_jsonl(data_dir / f"laya_{role}_train.jsonl")
-    calib_examples = read_jsonl(data_dir / f"laya_{role}_calib.jsonl")
+    prepared_by = "laya_finetune.py --stage prepare (notebook Section 5a)"
+    train_examples = read_jsonl(common.require(data_dir / f"laya_{role}_train.jsonl", prepared_by))
+    calib_examples = read_jsonl(common.require(data_dir / f"laya_{role}_calib.jsonl", prepared_by))
     if rank == 0:
         print(f"[laya_finetune/train] role={role} model={model_repo} device={device} "
               f"ddp={ddp_mode} world_size={world_size}")

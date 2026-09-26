@@ -51,14 +51,14 @@ def run(repo_root: Path, k: int, score_method: str, stack_model: str, laya_batch
         return
 
     # ---- 3. GBDT ----
-    with open(models_path / "gbdt_feature_columns.json") as f:
+    with open(common.require(models_path / "gbdt_feature_columns.json", "train_gbdt.py (notebook Section 4)")) as f:
         gbdt_cols = json.load(f)
     gbdt_model = lgb.Booster(model_file=str(models_path / "gbdt_model.txt"))
     gbdt_prob = train_gbdt.score_with_gbdt(gbdt_model, features_df, cols=gbdt_cols)
     print(f"[predict] GBDT scored {len(gbdt_prob)} pairs (mean prob {gbdt_prob.mean():.4f})")
 
     # ---- 4. Laya on the same shortlist rule ensemble.py trained with ----
-    with open(models_path / "ensemble_config.json") as f:
+    with open(common.require(models_path / "ensemble_config.json", "ensemble.py (notebook Section 6)")) as f:
         cfg = json.load(f)
     shortlist = ensemble.laya_shortlist_mask(features_df, gbdt_prob, cfg["laya_top_n"], cfg["laya_min_gbdt_prob"])
     routers = build_routers(repo_root)

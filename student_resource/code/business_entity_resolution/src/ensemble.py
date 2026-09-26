@@ -214,7 +214,7 @@ def run(repo_root: Path, features_path, val_frac: float, seed: int, laya_batch_s
     import lightgbm as lgb
 
     features_path = features_path or (common.data_processed_dir(repo_root) / "features_train.parquet")
-    features_df = pd.read_parquet(features_path)
+    features_df = pd.read_parquet(common.require(features_path, "features.py (notebook Section 3)"))
     ground_truth = common.load_split_sources(repo_root, "train")["ground_truth"]
     truth = common.ground_truth_map(ground_truth)
     labels = train_gbdt.label_pairs(features_df, ground_truth).astype(int).to_numpy()
@@ -224,7 +224,7 @@ def run(repo_root: Path, features_path, val_frac: float, seed: int, laya_batch_s
     val_mask = features_df["source1_entity_id"].isin(val_ids).to_numpy()
 
     models_path = common.models_dir(repo_root)
-    with open(models_path / "gbdt_feature_columns.json") as f:
+    with open(common.require(models_path / "gbdt_feature_columns.json", "train_gbdt.py (notebook Section 4)")) as f:
         gbdt_cols = json.load(f)
     gbdt_model = lgb.Booster(model_file=str(models_path / "gbdt_model.txt"))
     gbdt_prob = train_gbdt.score_with_gbdt(gbdt_model, features_df, cols=gbdt_cols)
