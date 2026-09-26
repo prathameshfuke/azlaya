@@ -6,6 +6,7 @@ drift from src/ because it's regenerated from it.
 Regenerate after editing anything in src/ (from code/business_entity_resolution/):
     python notebooks/build_notebook.py
 """
+import hashlib
 import json
 from pathlib import Path
 
@@ -105,11 +106,65 @@ print("STUDENT_RESOURCE_DIR:", STUDENT_RESOURCE_DIR)
 print("PIPELINE_DIR:        ", PIPELINE_DIR)
 """)
 
+def _as_fstring_path(nb_path: str) -> str:
+    return nb_path.replace("$PIPELINE_DIR", "{PIPELINE_DIR}").replace("$STUDENT_RESOURCE_DIR", "{STUDENT_RESOURCE_DIR}")
+
+
+_hash_lines_parts = []
 for nb_path, src_path in EMBEDDED:
     body = src_path.read_text(encoding="utf-8")
-    if body and not body.endswith("\n"):
+    if not body.strip():
+        # `%%writefile` is a cell magic that refuses a genuinely empty cell body ("UsageError:
+        # %%writefile is a cell magic, but the cell body is empty") -- src/__init__.py is 0
+        # bytes, which hit exactly that. This halted "Run All" at that cell in practice, which
+        # then skipped every cell after it (including src/common.py's own %%writefile) with no
+        # error of its own -- so common.py on disk stayed whatever old version was already
+        # there, which is what actually caused a later "module 'src.common' has no attribute
+        # ..." error, not a stale in-memory module. A one-line comment keeps the file's meaning
+        # (an empty Python package marker) while giving %%writefile a non-empty body.
+        body = "# (intentionally empty)\n"
+    elif not body.endswith("\n"):
         body += "\n"
     code(f"%%writefile {nb_path}\n{body}")
+    # Hash the exact `body` that gets written (not the raw source file), so the empty-file
+    # substitution above doesn't cause a spurious permanent mismatch for __init__.py.
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    _hash_lines_parts.append(f'_expected[f"{_as_fstring_path(nb_path)}"] = "{digest}"\n')
+_hash_lines = "".join(_hash_lines_parts)
+
+code(f"""\
+# Verify every file above actually landed on disk with current content, instead of trusting that
+# each %%writefile cell ran. A %%writefile cell errors and halts "Run All" on some inputs (e.g. a
+# genuinely empty file used to do this); every cell after the failure is then silently skipped,
+# leaving old file content in place with no error of its own -- that's what caused a later,
+# confusing "module 'src.common' has no attribute ..." several sections down, not a code bug.
+import hashlib
+import py_compile
+
+_expected = {{}}
+{_hash_lines}
+problems = []
+for path, expected_hash in _expected.items():
+    if not os.path.isfile(path):
+        problems.append(f"{{path}}: missing -- its %%writefile cell above didn't run")
+        continue
+    actual = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    if actual != expected_hash:
+        problems.append(f"{{path}}: on-disk content doesn't match this notebook -- re-run its %%writefile cell above")
+    if path.endswith(".py"):
+        try:
+            py_compile.compile(path, doraise=True)
+        except py_compile.PyCompileError as e:
+            problems.append(f"{{path}}: does not compile -- {{e}}")
+
+if problems:
+    raise RuntimeError(
+        "Section 0.2 did not finish writing the pipeline correctly:\\n  " + "\\n  ".join(problems)
+        + "\\n\\nRe-run the listed %%writefile cell(s) above (scroll up), confirm each one's output "
+          "starts with 'Writing' or 'Overwriting', then re-run this cell."
+    )
+print(f"Verified {{len(_expected)}} files on disk match this notebook.")
+""")
 
 md("""\
 ### 0.3 Install dependencies
