@@ -230,14 +230,42 @@ this cell reloads `src/` from disk.
 
 code("""\
 import gc
+import importlib
 import sys
 from pathlib import Path
 
 if PIPELINE_DIR not in sys.path:
     sys.path.insert(0, PIPELINE_DIR)
-for name in [m for m in sys.modules if m == "src" or m.startswith("src.")]:
-    del sys.modules[name]  # pick up any re-written src files
-from src import blocking, ensemble, features, laya_finetune, normalize, predict, train_gbdt
+
+_PIPELINE_MODULE_NAMES = ["common", "features", "blocking", "train_gbdt", "laya_finetune", "ensemble", "normalize", "predict"]
+
+
+def reload_pipeline():
+    \"\"\"Re-sync every pipeline module against what is CURRENTLY on disk in src/. Call this
+    (every step cell below does, automatically) before using any pipeline function.
+
+    Why this exists: a %%writefile cell only writes a file to disk -- it does not update code
+    already loaded into this running kernel. normalize.py's own `from src import common`, for
+    example, bound a specific `common` module OBJECT the first time normalize.py was imported;
+    rewriting common.py on disk afterwards does not change that object. importlib.reload()
+    re-executes a module's code INTO its existing object (unlike deleting it from sys.modules
+    and re-importing, which creates a new object other modules keep no reference to), so every
+    already-imported module sees the update immediately. This is what fixes
+    "module 'src.common' has no attribute 'require'"-style errors after editing a %%writefile
+    cell without a full kernel restart.
+
+    If reload() itself ever errors (rare -- can happen after a large structural edit, e.g.
+    removing a module-level name other code still imports by name), the reliable fallback is
+    Kaggle's Run menu -> Restart Session, then Run All from the top.
+    \"\"\"
+    mods = {}
+    for name in _PIPELINE_MODULE_NAMES:
+        full = f"src.{name}"
+        mods[name] = importlib.reload(sys.modules[full]) if full in sys.modules else importlib.import_module(full)
+    return mods
+
+
+globals().update(reload_pipeline())
 
 ROOT = Path(STUDENT_RESOURCE_DIR)
 DP = ROOT / "data_processed"
@@ -279,6 +307,7 @@ they were written by the current `normalize.py`; otherwise leave it `False`.
 """)
 
 code("""\
+reload_pipeline()
 SKIP_EXISTING = False
 normalize.run(ROOT, ["train", "test"], skip_existing=SKIP_EXISTING)
 free_memory()
@@ -306,6 +335,7 @@ pool, so hard negatives stay realistic. The test set is always blocked in full (
 """)
 
 code("""\
+reload_pipeline()
 MAX_TRAIN_S1 = 300_000
 blocking.run(ROOT, "train", k=30, out_path=DP / "candidate_pairs_train.tsv", report_recall=True,
              val_frac=0.2, seed=42, max_s1=MAX_TRAIN_S1)
@@ -321,6 +351,7 @@ DBA-aware name match. Computed in chunks for every candidate pair.
 """)
 
 code("""\
+reload_pipeline()
 features.run(ROOT, "train", DP / "candidate_pairs_train.tsv", None)
 free_memory()
 feat = pd.read_parquet(DP / "features_train.parquet")
@@ -338,6 +369,7 @@ training. Reports precision / recall / macro F_0.5 on the held-out entities.
 
 code("""\
 import json
+reload_pipeline()
 _ = train_gbdt.train(ROOT, DP / "features_train.parquet", val_frac=0.2, seed=42,
                      num_boost_round=2000, early_stopping_rounds=50)
 free_memory()
@@ -358,6 +390,7 @@ GPU time.
 """)
 
 code("""\
+reload_pipeline()
 MAX_FINETUNE_ENTITIES = 6000
 laya_finetune.stage_prepare(ROOT, None, val_frac=0.2, calib_frac=0.15, seed=42,
                             max_negatives_per_entity=3, max_finetune_entities=MAX_FINETUNE_ENTITIES)
@@ -380,6 +413,7 @@ in 0.2 first if you edited it.
 code("""\
 import torch
 
+reload_pipeline()
 N_GPUS = torch.cuda.device_count()
 print(f"visible GPUs: {N_GPUS}", [torch.cuda.get_device_name(i) for i in range(N_GPUS)])
 if N_GPUS == 0:
@@ -411,6 +445,7 @@ the same entities, broken down by country and singleton status.
 """)
 
 code("""\
+reload_pipeline()
 MAX_STACK_ENTITIES = 60_000
 free_memory()
 ensemble.run(ROOT, DP / "features_train.parquet", val_frac=0.2, seed=42,
@@ -443,6 +478,7 @@ Blocks **every** test S1 entity, then runs features, GBDT, Laya (unless `BEST_MO
 """)
 
 code("""\
+reload_pipeline()
 free_memory()
 predict.run(ROOT, k=30, stack_model=BEST_MODEL, laya_batch_size=ensemble.LAYA_BATCH_SIZE,
             threshold_override=None)
