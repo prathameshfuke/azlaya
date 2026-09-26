@@ -50,7 +50,7 @@ md("""\
 Runs the ML Challenge 2026 Business Entity Resolution pipeline end to end: normalize, blocking,
 features, GBDT, Laya fine-tuning, ensemble, test-set inference, validate, package.
 
-**Self-contained:** Section 0.2 writes every pipeline source file (`src/*.py`,
+**Self-contained:** Section 0.3 writes every pipeline source file (`src/*.py`,
 `requirements.txt`, `README.md`, the challenge's `validate_submission.py` and
 `Documentation_template.md`) from `%%writefile` cells, so all the code is visible here. Nothing is
 cloned or pulled at runtime. To change the pipeline, edit the `%%writefile` cell, re-run it, then
@@ -80,8 +80,33 @@ except FileNotFoundError:
     print("Sections 1-4 run on CPU; only Sections 5-7 need the GPU, so you can add it before Section 5.")
 """)
 
+md("### 0.2 Check internet access\n\nRequired for `pip install` below and (in Section 5) downloading Laya's base checkpoints from\nHugging Face Hub. On Kaggle, internet is OFF by default for new notebooks -- this is the single\nmost common reason \"Run All\" silently goes wrong partway through.\n")
+
+code("""\
+import urllib.request
+
+_INTERNET_HOSTS = ["https://pypi.org", "https://huggingface.co"]
+_unreachable = []
+for _host in _INTERNET_HOSTS:
+    try:
+        urllib.request.urlopen(_host, timeout=8)
+    except Exception as e:
+        _unreachable.append((_host, str(e)))
+
+if _unreachable:
+    detail = "\\n".join(f"  {h}: {e}" for h, e in _unreachable)
+    raise RuntimeError(
+        "No internet access from this session -- can't reach:\\n" + detail +
+        "\\n\\nKaggle: Settings (right sidebar) -> Internet -> turn ON, then Save Version / restart "
+        "the session and Run All again. (A phone number must be verified on the Kaggle account for "
+        "this toggle to be available.) Colab: internet is on by default; check your network/proxy "
+        "if this still fails there."
+    )
+print("Internet access OK:", ", ".join(_INTERNET_HOSTS))
+""")
+
 md("""\
-### 0.2 Write the pipeline code
+### 0.3 Write the pipeline code
 
 Creates the submission-package layout and writes every source file into it. Re-running these
 cells overwrites the files with the version shown here.
@@ -159,7 +184,7 @@ for path, expected_hash in _expected.items():
 
 if problems:
     raise RuntimeError(
-        "Section 0.2 did not finish writing the pipeline correctly:\\n  " + "\\n  ".join(problems)
+        "Section 0.3 did not finish writing the pipeline correctly:\\n  " + "\\n  ".join(problems)
         + "\\n\\nRe-run the listed %%writefile cell(s) above (scroll up), confirm each one's output "
           "starts with 'Writing' or 'Overwriting', then re-run this cell."
     )
@@ -167,18 +192,30 @@ print(f"Verified {{len(_expected)}} files on disk match this notebook.")
 """)
 
 md("""\
-### 0.3 Install dependencies
+### 0.4 Install dependencies
 
-Installs exactly `requirements.txt` (written above) and prints it first. Cell also self-heals a
-numpy/pandas binary mismatch if the install ever causes one.
+Installs exactly `requirements.txt` (written above) and prints it first. Runs pip as a checked
+subprocess (not `!pip`, whose failure `!`-shell syntax would NOT stop "Run All" -- it would just
+print an error and silently move on to cells that then fail confusingly with missing imports) so
+a real install failure stops here with pip's own error text. Also self-heals a numpy/pandas binary
+mismatch if the install ever causes one.
 """)
 
 code("""\
+import subprocess as _subprocess
+
 %cd $PIPELINE_DIR
 print(open("requirements.txt").read())
-!pip install -q -r requirements.txt
+_pip_result = _subprocess.run(["pip", "install", "-q", "-r", "requirements.txt"],
+                              capture_output=True, text=True)
+print(_pip_result.stdout)
+if _pip_result.returncode != 0:
+    raise RuntimeError(
+        "pip install failed (exit code " + str(_pip_result.returncode) + "):\\n" + _pip_result.stderr +
+        "\\n\\nCommon causes: internet is off (see 0.2 above), Kaggle disk quota, or a genuinely "
+        "unavailable package version."
+    )
 
-import subprocess as _subprocess
 try:
     import pandas as pd
     import numpy as np
@@ -194,7 +231,7 @@ print("laya", laya.__version__, "| torch", torch.__version__, "| transformers", 
 """)
 
 md("""\
-### 0.4 Provide the dataset
+### 0.5 Provide the dataset
 
 Attach **[prathameshfuke/dataset-ml](https://www.kaggle.com/datasets/prathameshfuke/dataset-ml)**
 (private: be signed into the `prathameshfuke` Kaggle account) via **+ Add Data** in the right
@@ -277,7 +314,7 @@ print("All dataset files found.")
 """)
 
 md("""\
-### 0.5 Load the pipeline modules
+### 0.6 Load the pipeline modules
 
 Steps run **in this kernel** (not as `!python` subprocesses) so progress bars are live. Re-running
 this cell reloads `src/` from disk.
@@ -462,7 +499,7 @@ separate processes, so this step can't run in-kernel. With one GPU it runs in-ke
 role saves a rolling `models/laya_<role>/checkpoint_latest/` after every epoch.
 
 Fine-tuning uses the `%%writefile` version of `src/laya_finetune.py` on disk, so re-run its cell
-in 0.2 first if you edited it.
+in 0.3 first if you edited it.
 """)
 
 code("""\

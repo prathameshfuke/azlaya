@@ -278,7 +278,7 @@ def run(repo_root, splits, skip_existing: bool = False):
             # one source at a time: holding all three raw splits at once needlessly doubles peak memory
             raw = common.read_source_tsv(common.require(
                 common.dataset_dir(repo_root, split) / common.SOURCE_FILENAMES[split][key],
-                "the dataset setup (notebook Section 0.3)"))
+                "the dataset setup (notebook Section 0.5)"))
             print(f"[normalize] {split}/{key}: {len(raw)} rows")
             normalized = normalize_frame(raw, label=f"{split}/{key}")
             del raw

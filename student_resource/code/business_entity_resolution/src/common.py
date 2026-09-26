@@ -121,7 +121,7 @@ def read_source_tsv(path) -> pd.DataFrame:
 def load_split_sources(repo_root: Path, split: str) -> Dict[str, pd.DataFrame]:
     d = dataset_dir(repo_root, split)
     names = SOURCE_FILENAMES[split]
-    out = {key: read_source_tsv(require(d / names[key], "the dataset setup (notebook Section 0.3)"))
+    out = {key: read_source_tsv(require(d / names[key], "the dataset setup (notebook Section 0.5)"))
            for key in SOURCE_KEYS}
     if split == "train":
         out["ground_truth"] = read_source_tsv(d / names["ground_truth"])
@@ -150,7 +150,7 @@ def sampled_ground_truth(repo_root: Path, candidates_path=None) -> pd.DataFrame:
                               sep="\t", dtype=str, usecols=["source1_entity_id"], keep_default_na=False)
                   ["source1_entity_id"])
     gt = read_source_tsv(require(dataset_dir(repo_root, "train") / SOURCE_FILENAMES["train"]["ground_truth"],
-                                 "the dataset setup (notebook Section 0.3)"))
+                                 "the dataset setup (notebook Section 0.5)"))
     return gt[gt["source1_entity_id"].isin(sampled)].reset_index(drop=True)
 
 
