@@ -141,11 +141,19 @@ def train(repo_root, features_path, val_frac: float, seed: int, num_boost_round:
     if extra_params:
         params.update(extra_params)
 
+    from tqdm.auto import tqdm
+
+    bar = tqdm(total=num_boost_round, desc="lightgbm", unit="iter")
+
+    def _progress(env):
+        bar.update(1)
+
     model = lgb.train(
         params, train_set, num_boost_round=num_boost_round,
         valid_sets=[val_set], valid_names=["val"],
-        callbacks=[lgb.early_stopping(early_stopping_rounds), lgb.log_evaluation(50)],
+        callbacks=[lgb.early_stopping(early_stopping_rounds), lgb.log_evaluation(100), _progress],
     )
+    bar.close()
 
     val_scores_full = np.zeros(len(features_df), dtype="float32")
     val_scores_full[val_mask] = model.predict(X_all[val_mask], num_iteration=model.best_iteration)

@@ -19,6 +19,8 @@ Writes data_processed/{split}_{source1,source2,source3}_normalized.tsv with colu
 from __future__ import annotations
 
 import argparse
+import multiprocessing
+import os
 import re
 from typing import Dict, Tuple
 
@@ -226,27 +228,43 @@ _OUTPUT_COLS = [
 ]
 
 
-def normalize_frame(df: pd.DataFrame, label: str = "") -> pd.DataFrame:
-    cols = {c: [] for c in _OUTPUT_COLS}
-    rows = zip(df["entity_id"], df["business_name"], df["business_address"], df["country"])
-    for entity_id, raw_name, raw_address, country in tqdm(
-            rows, total=len(df), desc=f"normalize {label}", unit="row", mininterval=2.0):
-        raw_name = raw_name or ""
-        raw_address = raw_address or ""
-        country = (country or "").strip()
-        fields = {
-            "entity_id": entity_id,
-            "business_name": raw_name,
-            "business_address": raw_address,
-            "country": country,
-            **normalize_name_fields(raw_name, country),
-            **normalize_address_fields(raw_address),
-            "name_script": common.detect_script(raw_name),
-            "address_script": common.detect_script(raw_address),
-        }
-        for c in _OUTPUT_COLS:
-            cols[c].append(fields[c])
-    return pd.DataFrame(cols)
+def normalize_row(row) -> tuple:
+    entity_id, raw_name, raw_address, country = row
+    raw_name = raw_name or ""
+    raw_address = raw_address or ""
+    country = (country or "").strip()
+    fields = {
+        "entity_id": entity_id,
+        "business_name": raw_name,
+        "business_address": raw_address,
+        "country": country,
+        **normalize_name_fields(raw_name, country),
+        **normalize_address_fields(raw_address),
+        "name_script": common.detect_script(raw_name),
+        "address_script": common.detect_script(raw_address),
+    }
+    return tuple(fields[c] for c in _OUTPUT_COLS)
+
+
+def normalize_frame(df: pd.DataFrame, label: str = "", workers: int = None) -> pd.DataFrame:
+    """Row-parallel across `workers` processes (default: every CPU core). Pure-Python regex work
+    like this is CPU-bound and doesn't benefit from a GPU; using all cores is the real speedup."""
+    workers = workers or os.cpu_count() or 1
+    rows = list(zip(df["entity_id"], df["business_name"], df["business_address"], df["country"]))
+    bar = tqdm(total=len(rows), desc=f"normalize {label}", unit="row", unit_scale=True, mininterval=1.0)
+    if workers == 1 or len(rows) < 20_000:
+        out = []
+        for row in rows:
+            out.append(normalize_row(row))
+            bar.update(1)
+    else:
+        out = []
+        with multiprocessing.get_context("fork").Pool(workers) as pool:
+            for result in pool.imap(normalize_row, rows, chunksize=2_000):
+                out.append(result)
+                bar.update(1)
+    bar.close()
+    return pd.DataFrame(out, columns=_OUTPUT_COLS)
 
 
 def run(repo_root, splits):

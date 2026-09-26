@@ -472,6 +472,27 @@ def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_
 
 # ---------------------------------------------------------------------------------- Router glue
 
+def build_routers(repo_root: Path) -> list:
+    """One Router per visible GPU (both T4s on Kaggle's T4x2), each pinned to its own device, so
+    ensemble.score_with_laya can run them in parallel. Falls back to a single CPU router. Prints
+    where each checkpoint actually landed: laya silently moves a checkpoint to CPU if it doesn't
+    fit in GPU memory, which would otherwise show up only as "CPU busy, GPU idle"."""
+    import torch
+
+    n_gpus = torch.cuda.device_count()
+    devices = [f"cuda:{i}" for i in range(n_gpus)] or ["cpu"]
+    routers = []
+    for device in devices:
+        router = build_router(repo_root, device=device)
+        for name, agent in router._agents.items():
+            print(f"[laya] router for {device}: checkpoint '{name}' loaded on {agent.device}")
+            if device != "cpu" and agent.device.type != "cuda":
+                print(f"[laya] WARNING: '{name}' fell back to CPU on {device} (likely GPU out of memory) "
+                      f"-- scoring will be very slow. Free GPU memory (restart the kernel after fine-tuning) and retry.")
+        routers.append(router)
+    return routers
+
+
 def build_router(repo_root: Path, device: str = None):
     """Assembles both fine-tuned checkpoints into a laya.Router, exactly the mechanism the
     challenge's fine-tuning step asks for: 'Use the Router (English vs multilingual checkpoint)

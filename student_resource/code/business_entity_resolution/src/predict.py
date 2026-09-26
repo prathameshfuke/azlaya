@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 
 from src import blocking, common, ensemble, features, train_gbdt
-from src.laya_finetune import build_router
+from src.laya_finetune import build_routers
 
 
 def run(repo_root: Path, k: int, score_method: str, stack_model: str, laya_batch_size: int,
@@ -61,8 +61,8 @@ def run(repo_root: Path, k: int, score_method: str, stack_model: str, laya_batch
     with open(models_path / "ensemble_config.json") as f:
         cfg = json.load(f)
     shortlist = ensemble.laya_shortlist_mask(features_df, gbdt_prob, cfg["laya_top_n"], cfg["laya_min_gbdt_prob"])
-    router = build_router(repo_root)
-    laya_prob = ensemble.score_with_laya(router, features_df, table, shortlist, batch_size=laya_batch_size)
+    routers = build_routers(repo_root)
+    laya_prob = ensemble.score_with_laya(routers, features_df, table, shortlist, batch_size=laya_batch_size)
 
     # ---- 5. ensemble stack ----
     with open(models_path / "ensemble_stack_columns.json") as f:
@@ -103,7 +103,7 @@ def main():
     parser.add_argument("--k", type=int, default=blocking.DEFAULT_K)
     parser.add_argument("--score-method", choices=["jaccard", "tfidf"], default="jaccard")
     parser.add_argument("--stack-model", choices=["logistic", "gbdt_alt"], default="logistic")
-    parser.add_argument("--laya-batch-size", type=int, default=64)
+    parser.add_argument("--laya-batch-size", type=int, default=ensemble.LAYA_BATCH_SIZE)
     parser.add_argument("--threshold", type=float, default=None,
                         help="Override the threshold saved by ensemble.py.")
     args = parser.parse_args()

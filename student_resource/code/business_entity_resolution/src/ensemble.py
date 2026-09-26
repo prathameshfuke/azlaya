@@ -32,12 +32,15 @@ from tqdm.auto import tqdm
 from src import common
 from src import train_gbdt
 from src.features import load_entity_table
-from src.laya_finetune import SAME_ENTITY_CRITERIA, SAME_ENTITY_INSTRUCTIONS, build_router
+from src.laya_finetune import SAME_ENTITY_CRITERIA, SAME_ENTITY_INSTRUCTIONS, build_routers
 
 DEFAULT_THRESHOLDS = [round(t, 2) for t in np.arange(0.05, 0.96, 0.05)]
 LAYA_TOP_N = 3
 LAYA_MIN_GBDT_PROB = 0.05
 LAYA_CHUNK = 20_000
+# Records are short ("name | address | country"), so a large batch keeps a T4 busy; 64 left it
+# mostly idle waiting on CPU-side tokenization between tiny forward passes.
+LAYA_BATCH_SIZE = 256
 
 
 # ------------------------------------------------------------------------------------- Laya pass
@@ -54,10 +57,17 @@ def record_texts(table: pd.DataFrame) -> pd.Series:
     return table["business_name"] + " | " + table["business_address"] + " | " + table["country"]
 
 
-def score_with_laya(router, features_df: pd.DataFrame, table: pd.DataFrame, mask: np.ndarray,
-                    batch_size: int = 64, chunk_size: int = LAYA_CHUNK) -> np.ndarray:
-    """P(same_entity) for rows where `mask` is True (0.0 elsewhere), via Router.predict_batch in
-    chunks so the request list never holds the whole shortlist at once."""
+def score_with_laya(routers, features_df: pd.DataFrame, table: pd.DataFrame, mask: np.ndarray,
+                    batch_size: int = LAYA_BATCH_SIZE, chunk_size: int = LAYA_CHUNK) -> np.ndarray:
+    """P(same_entity) for rows where `mask` is True (0.0 elsewhere). Chunks are spread across
+    `routers` (one per GPU, from laya_finetune.build_routers) by a thread pool -- each worker
+    checks a router out of a queue, so no two chunks share a GPU at once. torch releases the GIL
+    during forward passes, so two T4s genuinely run concurrently."""
+    import queue
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not isinstance(routers, (list, tuple)):
+        routers = [routers]
     questions = {"same_entity": {"type": "noul", "instructions": SAME_ENTITY_INSTRUCTIONS,
                                  "criteria": SAME_ENTITY_CRITERIA}}
     texts = record_texts(table)
@@ -65,14 +75,29 @@ def score_with_laya(router, features_df: pd.DataFrame, table: pd.DataFrame, mask
     idx = np.flatnonzero(mask)
     s1_col = features_df["source1_entity_id"].to_numpy()
     cand_col = features_df["candidate_entity_id"].to_numpy()
-    print(f"[laya] scoring {len(idx)} shortlisted pairs of {len(features_df)}")
-    for start in tqdm(range(0, len(idx), chunk_size), desc="laya scoring", unit="chunk"):
-        rows = idx[start:start + chunk_size]
-        a = texts.loc[s1_col[rows]].tolist()
-        b = texts.loc[cand_col[rows]].tolist()
-        requests = [{"state": {"record_a": x, "record_b": y}, "questions": questions} for x, y in zip(a, b)]
-        results = router.predict_batch(requests, batch_size=batch_size)
-        out[rows] = [res["answers"]["same_entity"]["noul"] for res in results]
+    chunks = [idx[start:start + chunk_size] for start in range(0, len(idx), chunk_size)]
+    print(f"[laya] scoring {len(idx)} shortlisted pairs of {len(features_df)} on {len(routers)} device(s)")
+
+    free = queue.Queue()
+    for router in routers:
+        free.put(router)
+
+    def _score(rows):
+        router = free.get()
+        try:
+            a = texts.loc[s1_col[rows]].tolist()
+            b = texts.loc[cand_col[rows]].tolist()
+            requests = [{"state": {"record_a": x, "record_b": y}, "questions": questions} for x, y in zip(a, b)]
+            results = router.predict_batch(requests, batch_size=batch_size)
+            return rows, [res["answers"]["same_entity"]["noul"] for res in results]
+        finally:
+            free.put(router)
+
+    with ThreadPoolExecutor(max_workers=len(routers)) as pool, \
+            tqdm(total=len(idx), desc="laya scoring", unit="pair", unit_scale=True) as bar:
+        for rows, probs in pool.map(_score, chunks):
+            out[rows] = probs
+            bar.update(len(rows))
     return out
 
 
@@ -206,8 +231,8 @@ def run(repo_root: Path, features_path, val_frac: float, seed: int, laya_batch_s
 
     table = load_entity_table(repo_root, "train")
     shortlist = laya_shortlist_mask(features_df, gbdt_prob, laya_top_n, laya_min_gbdt_prob)
-    router = build_router(repo_root)
-    laya_prob = score_with_laya(router, features_df, table, shortlist, batch_size=laya_batch_size)
+    routers = build_routers(repo_root)
+    laya_prob = score_with_laya(routers, features_df, table, shortlist, batch_size=laya_batch_size)
 
     stack_df = build_stack_frame(features_df, gbdt_prob, laya_prob, shortlist, gbdt_cols)
     cols = stack_columns(gbdt_cols)
@@ -258,7 +283,7 @@ def main():
                         help="Path to features_train.parquet. Default: data_processed/features_train.parquet")
     parser.add_argument("--val-frac", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--laya-batch-size", type=int, default=64)
+    parser.add_argument("--laya-batch-size", type=int, default=LAYA_BATCH_SIZE)
     parser.add_argument("--laya-top-n", type=int, default=LAYA_TOP_N)
     parser.add_argument("--laya-min-gbdt-prob", type=float, default=LAYA_MIN_GBDT_PROB)
     args = parser.parse_args()

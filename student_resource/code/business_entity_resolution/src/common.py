@@ -73,14 +73,30 @@ def models_dir(repo_root: Path) -> Path:
 
 # --------------------------------------------------------------------------------------- raw IO
 
-def read_source_tsv(path) -> pd.DataFrame:
-    """Read one source/ground-truth TSV. Every column is read as `str` with no NaN coercion:
-    a literal empty field stays "" rather than becoming float NaN, and the "null"/"NaN"/"N/A"
-    *strings* some address fields contain are left untouched here (they are real content, and
-    normalize.py is what's responsible for stripping them, not the reader)."""
-    df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, na_filter=False)
+_READ_CHUNK_ROWS = 200_000
+
+
+def _read_tsv_with_progress(path) -> pd.DataFrame:
+    """Every column as `str`, no NaN coercion (an empty field stays ""), read in chunks so large
+    files show a live row count instead of a silent multi-minute pause."""
+    from tqdm.auto import tqdm
+
+    path = Path(path)
+    chunks = []
+    with tqdm(desc=f"read {path.name}", unit="row", unit_scale=True, mininterval=1.0) as bar:
+        for chunk in pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, na_filter=False,
+                                 chunksize=_READ_CHUNK_ROWS):
+            chunks.append(chunk)
+            bar.update(len(chunk))
+    df = pd.concat(chunks, ignore_index=True) if chunks else pd.read_csv(path, sep="\t", dtype=str)
     df.columns = [c.strip() for c in df.columns]
     return df
+
+
+def read_source_tsv(path) -> pd.DataFrame:
+    """Read one source/ground-truth TSV. The "null"/"NaN"/"N/A" *strings* some address fields
+    contain are left untouched here (they are real content; normalize.py strips them)."""
+    return _read_tsv_with_progress(path)
 
 
 def load_split_sources(repo_root: Path, split: str) -> Dict[str, pd.DataFrame]:
@@ -99,8 +115,7 @@ def normalized_path(repo_root: Path, split: str, key: str) -> Path:
 
 
 def load_normalized(repo_root: Path, split: str, key: str) -> pd.DataFrame:
-    path = normalized_path(repo_root, split, key)
-    return pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, na_filter=False)
+    return _read_tsv_with_progress(normalized_path(repo_root, split, key))
 
 
 def write_normalized(df: pd.DataFrame, repo_root: Path, split: str, key: str) -> Path:
