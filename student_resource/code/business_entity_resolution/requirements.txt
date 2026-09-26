@@ -15,7 +15,8 @@ pandas>=2.0
 numpy>=1.24
 pyarrow>=14.0            # parquet IO for the features_{split}.parquet tables
 scikit-learn>=1.3        # TfidfVectorizer (blocking/features), LogisticRegression (ensemble)
-rapidfuzz>=3.5,<4.0      # Levenshtein / Jaro-Winkler string similarity
+rapidfuzz>=3.6,<4.0      # Levenshtein / Jaro-Winkler; process.cpdist (vectorized pairwise) needs >=3.6
+tqdm>=4.66               # progress bars in every long-running step
 lightgbm>=4.1,<5.0
 joblib>=1.3              # persists the logistic-regression stacker
 

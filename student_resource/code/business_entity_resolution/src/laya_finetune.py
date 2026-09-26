@@ -45,6 +45,8 @@ import random
 from pathlib import Path
 from typing import Dict, List
 
+from tqdm.auto import tqdm
+
 from src import common
 from src.features import load_entity_lookup
 
@@ -97,18 +99,25 @@ def make_example(rec_a: dict, rec_b: dict, label_true: bool) -> dict:
 
 
 def build_examples(candidate_map: Dict[str, set], lookup: Dict[str, dict], truth: Dict[str, set],
-                    s1_ids: set) -> List[dict]:
+                    s1_ids: set, max_negatives_per_entity: int, seed: int) -> List[dict]:
+    """Every positive pair, plus up to `max_negatives_per_entity` randomly-chosen hard negatives
+    per S1 entity. Using all ~K negatives per entity on the full training set produces millions of
+    examples -- more than a Kaggle session can tokenize in RAM, let alone train on in time -- and
+    heavily over-weights "false" anyway."""
+    rng = random.Random(seed)
     examples = []
-    for s1 in s1_ids:
+    for s1 in tqdm(sorted(s1_ids), desc="laya examples", unit="entity", mininterval=2.0):
         s1_rec = lookup.get(s1)
         if s1_rec is None:
             continue
         true_ids = truth.get(s1, set())
-        for cand in candidate_map.get(s1, set()):
-            cand_rec = lookup.get(cand)
-            if cand_rec is None:
-                continue
-            label_true = cand in true_ids
+        cands = sorted(c for c in candidate_map.get(s1, ()) if c in lookup)
+        positives = [c for c in cands if c in true_ids]
+        negatives = [c for c in cands if c not in true_ids]
+        if len(negatives) > max_negatives_per_entity:
+            negatives = rng.sample(negatives, max_negatives_per_entity)
+        for cand, label_true in [(c, True) for c in positives] + [(c, False) for c in negatives]:
+            cand_rec = lookup[cand]
             examples.append(make_example(s1_rec, cand_rec, label_true))
             examples.append(make_example(cand_rec, s1_rec, label_true))  # swapped-order copy
     return examples
@@ -133,7 +142,8 @@ def read_jsonl(path: Path) -> List[dict]:
 
 # ------------------------------------------------------------------------------------- prepare
 
-def stage_prepare(repo_root: Path, candidates_path, val_frac: float, calib_frac: float, seed: int):
+def stage_prepare(repo_root: Path, candidates_path, val_frac: float, calib_frac: float, seed: int,
+                  max_negatives_per_entity: int):
     ground_truth = common.load_split_sources(repo_root, "train")["ground_truth"]
     truth = common.ground_truth_map(ground_truth)
     train_ids, val_ids = common.stratified_split_by_s1(ground_truth, val_frac=val_frac, seed=seed)
@@ -151,8 +161,8 @@ def stage_prepare(repo_root: Path, candidates_path, val_frac: float, calib_frac:
     candidate_map = common.read_id_list_tsv(candidates_path)
     lookup = load_entity_lookup(repo_root, "train")
 
-    finetune_examples = build_examples(candidate_map, lookup, truth, finetune_ids)
-    calib_examples = build_examples(candidate_map, lookup, truth, calib_ids)
+    finetune_examples = build_examples(candidate_map, lookup, truth, finetune_ids, max_negatives_per_entity, seed)
+    calib_examples = build_examples(candidate_map, lookup, truth, calib_ids, max_negatives_per_entity, seed + 1)
     print(f"[laya_finetune/prepare] built {len(finetune_examples)} fine-tune / "
           f"{len(calib_examples)} calibration examples (each pair contributes 2: original + "
           f"swapped-order copy)")
@@ -288,8 +298,11 @@ def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_
         print(f"[laya_finetune/train] {len(train_examples)} train / {len(calib_examples)} "
               f"calibration examples (calibration held out of training, never seen by any rank)")
 
-    train_items = [it for ex in train_examples if (it := _build_training_item(tok, cfg, ex)) is not None]
-    calib_items = [it for ex in calib_examples if (it := _build_training_item(tok, cfg, ex)) is not None]
+    quiet = rank != 0
+    train_items = [it for ex in tqdm(train_examples, desc="tokenize train", disable=quiet, mininterval=2.0)
+                   if (it := _build_training_item(tok, cfg, ex)) is not None]
+    calib_items = [it for ex in tqdm(calib_examples, desc="tokenize calib", disable=quiet, mininterval=2.0)
+                   if (it := _build_training_item(tok, cfg, ex)) is not None]
     dropped = (len(train_examples) - len(train_items)) + (len(calib_examples) - len(calib_items))
     if dropped and rank == 0:
         print(f"[laya_finetune/train] WARNING: {dropped} example(s) dropped by build_sequence "
@@ -336,7 +349,8 @@ def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_
         optimizer.zero_grad(set_to_none=True)
         sigma = sigma_start + (sigma_end - sigma_start) * (epoch / max(1, epochs - 1))
 
-        for b_idx in range(0, len(my_items), micro_batch):
+        for b_idx in tqdm(range(0, len(my_items), micro_batch), desc=f"epoch {epoch + 1}/{epochs}",
+                          unit="batch", disable=quiet, mininterval=5.0):
             chunk = my_items[b_idx:b_idx + micro_batch]
             if not chunk:
                 continue
@@ -494,6 +508,8 @@ def main():
     parser.add_argument("--calib-frac", type=float, default=0.15,
                          help="[prepare] Fraction of the TRAIN pool (not val) carved out for "
                               "Laya's post-training calibration fit.")
+    parser.add_argument("--max-negatives-per-entity", type=int, default=3,
+                         help="[prepare] Hard negatives kept per S1 entity (all positives are kept).")
     # train
     parser.add_argument("--role", choices=list(ROLES), default=None,
                          help="[train] Which checkpoint to fine-tune.")
@@ -507,7 +523,8 @@ def main():
     args = parser.parse_args()
 
     if args.stage == "prepare":
-        stage_prepare(args.repo_root, args.candidates, args.val_frac, args.calib_frac, args.seed)
+        stage_prepare(args.repo_root, args.candidates, args.val_frac, args.calib_frac, args.seed,
+                      args.max_negatives_per_entity)
     else:
         if not args.role:
             raise SystemExit("--stage train requires --role {english,multilingual}")

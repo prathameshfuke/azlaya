@@ -50,11 +50,9 @@ def _bool_and_str_to_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 
 def label_pairs(features_df: pd.DataFrame, ground_truth: pd.DataFrame) -> pd.Series:
     truth = common.ground_truth_map(ground_truth)
-
-    def _is_positive(row) -> bool:
-        return row.candidate_entity_id in truth.get(row.source1_entity_id, set())
-
-    return features_df.apply(_is_positive, axis=1)
+    positive_keys = {f"{s1}|{c}" for s1, ids in truth.items() for c in ids}
+    keys = features_df["source1_entity_id"] + "|" + features_df["candidate_entity_id"]
+    return keys.isin(positive_keys)
 
 
 def build_dataset(repo_root, features_path):

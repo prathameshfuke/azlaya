@@ -23,6 +23,7 @@ import re
 from typing import Dict, Tuple
 
 import pandas as pd
+from tqdm.auto import tqdm
 
 from src import common
 
@@ -218,29 +219,34 @@ def normalize_address_fields(raw_address: str) -> Dict[str, str]:
 
 # --------------------------------------------------------------------------------------- driver
 
-def normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
-    records = []
-    for row in df.itertuples(index=False):
-        row_d = row._asdict()
-        entity_id = row_d.get("entity_id", "")
-        raw_name = row_d.get("business_name", "") or ""
-        raw_address = row_d.get("business_address", "") or ""
-        country = (row_d.get("country", "") or "").strip()
+_OUTPUT_COLS = [
+    "entity_id", "business_name", "business_address", "country",
+    "name_norm", "legal_name_norm", "trade_name_norm", "has_dba",
+    "address_norm", "pin_code", "city_guess", "name_script", "address_script",
+]
 
-        name_fields = normalize_name_fields(raw_name, country)
-        addr_fields = normalize_address_fields(raw_address)
 
-        records.append({
+def normalize_frame(df: pd.DataFrame, label: str = "") -> pd.DataFrame:
+    cols = {c: [] for c in _OUTPUT_COLS}
+    rows = zip(df["entity_id"], df["business_name"], df["business_address"], df["country"])
+    for entity_id, raw_name, raw_address, country in tqdm(
+            rows, total=len(df), desc=f"normalize {label}", unit="row", mininterval=2.0):
+        raw_name = raw_name or ""
+        raw_address = raw_address or ""
+        country = (country or "").strip()
+        fields = {
             "entity_id": entity_id,
             "business_name": raw_name,
             "business_address": raw_address,
             "country": country,
-            **name_fields,
-            **addr_fields,
+            **normalize_name_fields(raw_name, country),
+            **normalize_address_fields(raw_address),
             "name_script": common.detect_script(raw_name),
             "address_script": common.detect_script(raw_address),
-        })
-    return pd.DataFrame.from_records(records)
+        }
+        for c in _OUTPUT_COLS:
+            cols[c].append(fields[c])
+    return pd.DataFrame(cols)
 
 
 def run(repo_root, splits):
@@ -248,7 +254,7 @@ def run(repo_root, splits):
         sources = common.load_split_sources(repo_root, split)
         for key in common.SOURCE_KEYS:
             print(f"[normalize] {split}/{key}: {len(sources[key])} rows")
-            normalized = normalize_frame(sources[key])
+            normalized = normalize_frame(sources[key], label=f"{split}/{key}")
             out_path = common.write_normalized(normalized, repo_root, split, key)
             print(f"[normalize]   -> {out_path}")
 

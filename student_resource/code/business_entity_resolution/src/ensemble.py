@@ -1,23 +1,22 @@
-"""Step 6: ensemble -- score candidates with fine-tuned Laya, stack with the GBDT features, refit
-the F_0.5 threshold on the stack's own output, and report macro F_0.5 by country and singleton
-status.
+"""Step 6: ensemble -- score a shortlist of candidates with fine-tuned Laya, stack with the GBDT
+features, refit the F_0.5 threshold on the stack's own output, and report macro F_0.5 by country
+and singleton status.
 
-Not executed here (needs the fine-tuned Laya checkpoints from laya_finetune.py and a GPU for
-reasonable Laya inference speed -- CPU works too, just slowly). Read back on the GPU machine and
-compare the printed threshold-sweep / country-breakdown numbers against train_gbdt.py's plain-GBDT
-val report before trusting that Laya + stacking actually helped: NEEDS GPU-MACHINE VERIFICATION,
-this cannot be assumed to be an improvement without measuring it.
+Laya scores a SHORTLIST, not every candidate pair: with ~30 candidates per S1 entity the full
+pair set is millions of rows, and a transformer forward pass per pair doesn't fit in a Kaggle
+session. The shortlist is each S1 entity's top LAYA_TOP_N candidates by GBDT probability, restricted
+to those with gbdt_prob >= LAYA_MIN_GBDT_PROB. Pairs below that bar are already confident GBDT
+rejections; Laya's job is the semantic cases near the top of the list (DBA names, domain-as-name,
+paraphrased legal names). Unscored pairs get laya_prob=0 and laya_scored=0, so the stacker can tell
+"Laya said no" from "Laya never looked". The SAME shortlist rule is applied in predict.py.
 
-Run (from code/business_entity_resolution/), after train_gbdt.py and laya_finetune.py --stage
-train have both produced their model artifacts:
-    python -m src.ensemble --features data_processed/features_train.parquet
+Run (from code/business_entity_resolution/), after train_gbdt.py and laya_finetune.py --stage train:
+    python -m src.ensemble --features ../../data_processed/features_train.parquet
 
 Writes:
-    models/ensemble_lr.joblib                  (primary: LogisticRegression stacker)
-    models/ensemble_gbdt_alt.txt                (alternative: shallow LightGBM stacker)
-    models/ensemble_stack_columns.json          (exact stacking feature column order)
-    models/ensemble_threshold.json              (F_0.5-optimal decision threshold, per model)
-    data_processed/ensemble_val_report.json     (macro F_0.5 by country + singleton breakdown)
+    models/ensemble_lr.joblib, models/ensemble_gbdt_alt.txt, models/ensemble_stack_columns.json,
+    models/ensemble_threshold.json, models/ensemble_config.json (shortlist settings),
+    data_processed/ensemble_val_report.json
 """
 from __future__ import annotations
 
@@ -28,55 +27,76 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 
 from src import common
 from src import train_gbdt
-from src.features import load_entity_lookup
-from src.laya_finetune import record_text, SAME_ENTITY_INSTRUCTIONS, SAME_ENTITY_CRITERIA, build_router
+from src.features import load_entity_table
+from src.laya_finetune import SAME_ENTITY_CRITERIA, SAME_ENTITY_INSTRUCTIONS, build_router
 
 DEFAULT_THRESHOLDS = [round(t, 2) for t in np.arange(0.05, 0.96, 0.05)]
+LAYA_TOP_N = 3
+LAYA_MIN_GBDT_PROB = 0.05
+LAYA_CHUNK = 20_000
 
 
 # ------------------------------------------------------------------------------------- Laya pass
 
-def score_with_laya(router, features_df: pd.DataFrame, lookup: Dict[str, dict],
-                     batch_size: int = 64) -> np.ndarray:
-    """Batched Laya scoring via `Router.predict_batch` (README: "predict_batch routes the full
-    workload first, groups requests by checkpoint... dispatched to Agent.predict_batch() so
-    states can share forward passes"). Returns P(same_entity) per row of `features_df`, in order.
-    """
+def laya_shortlist_mask(features_df: pd.DataFrame, gbdt_prob: np.ndarray, top_n: int,
+                        min_prob: float) -> np.ndarray:
+    frame = pd.DataFrame({"s1": features_df["source1_entity_id"].to_numpy(), "p": gbdt_prob})
+    rank = frame.groupby("s1")["p"].rank(method="first", ascending=False)
+    return ((rank <= top_n) & (frame["p"] >= min_prob)).to_numpy()
+
+
+def record_texts(table: pd.DataFrame) -> pd.Series:
+    """Same "name | address | country" format laya_finetune.record_text uses for training."""
+    return table["business_name"] + " | " + table["business_address"] + " | " + table["country"]
+
+
+def score_with_laya(router, features_df: pd.DataFrame, table: pd.DataFrame, mask: np.ndarray,
+                    batch_size: int = 64, chunk_size: int = LAYA_CHUNK) -> np.ndarray:
+    """P(same_entity) for rows where `mask` is True (0.0 elsewhere), via Router.predict_batch in
+    chunks so the request list never holds the whole shortlist at once."""
     questions = {"same_entity": {"type": "noul", "instructions": SAME_ENTITY_INSTRUCTIONS,
-                                  "criteria": SAME_ENTITY_CRITERIA}}
-    requests = []
-    for row in features_df.itertuples(index=False):
-        s1 = lookup.get(row.source1_entity_id, {})
-        cand = lookup.get(row.candidate_entity_id, {})
-        requests.append({"state": {"record_a": record_text(s1), "record_b": record_text(cand)},
-                          "questions": questions})
-    results = router.predict_batch(requests, batch_size=batch_size)
-    return np.array([res["answers"]["same_entity"]["noul"] for res in results], dtype="float32")
+                                 "criteria": SAME_ENTITY_CRITERIA}}
+    texts = record_texts(table)
+    out = np.zeros(len(features_df), dtype=np.float32)
+    idx = np.flatnonzero(mask)
+    s1_col = features_df["source1_entity_id"].to_numpy()
+    cand_col = features_df["candidate_entity_id"].to_numpy()
+    print(f"[laya] scoring {len(idx)} shortlisted pairs of {len(features_df)}")
+    for start in tqdm(range(0, len(idx), chunk_size), desc="laya scoring", unit="chunk"):
+        rows = idx[start:start + chunk_size]
+        a = texts.loc[s1_col[rows]].tolist()
+        b = texts.loc[cand_col[rows]].tolist()
+        requests = [{"state": {"record_a": x, "record_b": y}, "questions": questions} for x, y in zip(a, b)]
+        results = router.predict_batch(requests, batch_size=batch_size)
+        out[rows] = [res["answers"]["same_entity"]["noul"] for res in results]
+    return out
 
 
 # ------------------------------------------------------------------------------- stacking table
 
 def build_stack_frame(features_df: pd.DataFrame, gbdt_prob: np.ndarray, laya_prob: np.ndarray,
-                       base_cols: List[str]) -> pd.DataFrame:
+                      laya_scored: np.ndarray, base_cols: List[str]) -> pd.DataFrame:
     stack = features_df[base_cols].astype("float32").copy()
     stack["gbdt_prob"] = gbdt_prob.astype("float32")
     stack["laya_prob"] = laya_prob.astype("float32")
+    stack["laya_scored"] = laya_scored.astype("float32")
     return stack
 
 
 def stack_columns(base_cols: List[str]) -> List[str]:
-    return list(base_cols) + ["gbdt_prob", "laya_prob"]
+    return list(base_cols) + ["gbdt_prob", "laya_prob", "laya_scored"]
 
 
 # ---------------------------------------------------------------------------------- train stack
 
 def train_logistic_stacker(X_train, y_train):
     from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
     from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
 
     pipe = Pipeline([
         ("scale", StandardScaler()),
@@ -96,9 +116,8 @@ def train_shallow_gbdt_stacker(X_train, y_train, X_val, y_val, cols: List[str], 
         "num_leaves": 7, "max_depth": 3, "min_data_in_leaf": 30,
         "is_unbalance": True, "verbose": -1, "seed": seed,
     }
-    model = lgb.train(params, train_set, num_boost_round=500, valid_sets=[val_set],
-                       callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)])
-    return model
+    return lgb.train(params, train_set, num_boost_round=500, valid_sets=[val_set],
+                     callbacks=[lgb.early_stopping(30), lgb.log_evaluation(0)])
 
 
 def score_stack(model, kind: str, X) -> np.ndarray:
@@ -109,19 +128,25 @@ def score_stack(model, kind: str, X) -> np.ndarray:
 
 # ---------------------------------------------------------------------- threshold + evaluation
 
-def best_threshold(pairs_df: pd.DataFrame, scores: np.ndarray, truth: Dict[str, set],
-                    eval_ids: set, thresholds=None) -> Dict:
-    thresholds = thresholds if thresholds is not None else DEFAULT_THRESHOLDS
-    empty_pred = {s1: set() for s1 in eval_ids}
-    eval_truth = {s1: ids for s1, ids in truth.items() if s1 in eval_ids}
+def predicted_sets(pairs_df: pd.DataFrame, scores: np.ndarray, threshold: float,
+                   eval_ids) -> Dict[str, set]:
+    pred = {s1: set() for s1 in eval_ids}
+    keep = scores >= threshold
+    for s1, cand in zip(pairs_df["source1_entity_id"].to_numpy()[keep],
+                        pairs_df["candidate_entity_id"].to_numpy()[keep]):
+        if s1 in pred:
+            pred[s1].add(cand)
+    return pred
 
+
+def best_threshold(pairs_df: pd.DataFrame, scores: np.ndarray, truth: Dict[str, set],
+                   eval_ids: set, thresholds=None) -> Dict:
+    thresholds = thresholds if thresholds is not None else DEFAULT_THRESHOLDS
+    eval_truth = {s1: ids for s1, ids in truth.items() if s1 in eval_ids}
     best = {"threshold": 0.5, "macro_f0_5": -1.0}
     sweep = {}
-    for t in thresholds:
-        pred = dict(empty_pred)
-        for s1, cand, score in zip(pairs_df["source1_entity_id"], pairs_df["candidate_entity_id"], scores):
-            if s1 in pred and score >= t:
-                pred[s1].add(cand)
+    for t in tqdm(thresholds, desc="threshold sweep", unit="t"):
+        pred = predicted_sets(pairs_df, scores, t, eval_ids)
         precision, recall = common.precision_recall_macro(pred, eval_truth)
         macro_f05 = common.macro_f_beta(pred, eval_truth, beta=0.5)
         sweep[str(t)] = {"precision": precision, "recall": recall, "macro_f0_5": macro_f05}
@@ -131,39 +156,38 @@ def best_threshold(pairs_df: pd.DataFrame, scores: np.ndarray, truth: Dict[str, 
 
 
 def breakdown_report(pairs_df: pd.DataFrame, scores: np.ndarray, threshold: float,
-                      truth: Dict[str, set], eval_ids: set, lookup: Dict[str, dict]) -> Dict:
-    """Macro F_0.5 broken down by country (esp. France, which Laya never trains/calibrates on --
-    see laya_finetune.py's script-based routing) and separately for singleton vs non-singleton
-    entities."""
-    pred = {s1: set() for s1 in eval_ids}
-    for s1, cand, score in zip(pairs_df["source1_entity_id"], pairs_df["candidate_entity_id"], scores):
-        if s1 in pred and score >= threshold:
-            pred[s1].add(cand)
+                     truth: Dict[str, set], eval_ids: set, table: pd.DataFrame) -> Dict:
+    """Macro F_0.5 by country (esp. France, which Laya never trains on) and by singleton status."""
+    pred = predicted_sets(pairs_df, scores, threshold, eval_ids)
     eval_truth = {s1: ids for s1, ids in truth.items() if s1 in eval_ids}
-
     per_entity = common.f_beta_per_entity(pred, eval_truth, beta=0.5)
+    countries = table["country"]
 
     by_country: Dict[str, List[float]] = {}
     singleton_scores, nonsingleton_scores = [], []
     for s1, score in per_entity.items():
-        s1_rec = lookup.get(s1, {})
-        country = s1_rec.get("country", "unknown") or "unknown"
+        country = (countries.get(s1) or "unknown") if s1 in countries.index else "unknown"
         by_country.setdefault(country, []).append(score)
         (singleton_scores if not eval_truth.get(s1) else nonsingleton_scores).append(score)
 
+    def _mean(v):
+        return sum(v) / len(v) if v else float("nan")
+
     return {
-        "overall_macro_f0_5": sum(per_entity.values()) / len(per_entity) if per_entity else float("nan"),
-        "by_country": {c: {"n": len(v), "macro_f0_5": sum(v) / len(v)} for c, v in sorted(by_country.items())},
-        "singletons": {"n": len(singleton_scores),
-                       "macro_f0_5": (sum(singleton_scores) / len(singleton_scores)) if singleton_scores else float("nan")},
-        "non_singletons": {"n": len(nonsingleton_scores),
-                            "macro_f0_5": (sum(nonsingleton_scores) / len(nonsingleton_scores)) if nonsingleton_scores else float("nan")},
+        "overall_macro_f0_5": _mean(list(per_entity.values())),
+        "by_country": {c: {"n": len(v), "macro_f0_5": _mean(v)} for c, v in sorted(by_country.items())},
+        "singletons": {"n": len(singleton_scores), "macro_f0_5": _mean(singleton_scores)},
+        "non_singletons": {"n": len(nonsingleton_scores), "macro_f0_5": _mean(nonsingleton_scores)},
     }
 
 
 # --------------------------------------------------------------------------------------- driver
 
-def run(repo_root: Path, features_path, val_frac: float, seed: int, laya_batch_size: int):
+def run(repo_root: Path, features_path, val_frac: float, seed: int, laya_batch_size: int,
+        laya_top_n: int, laya_min_gbdt_prob: float):
+    import joblib
+    import lightgbm as lgb
+
     features_path = features_path or (common.data_processed_dir(repo_root) / "features_train.parquet")
     features_df = pd.read_parquet(features_path)
     ground_truth = common.load_split_sources(repo_root, "train")["ground_truth"]
@@ -177,68 +201,69 @@ def run(repo_root: Path, features_path, val_frac: float, seed: int, laya_batch_s
     models_path = common.models_dir(repo_root)
     with open(models_path / "gbdt_feature_columns.json") as f:
         gbdt_cols = json.load(f)
-    import lightgbm as lgb
     gbdt_model = lgb.Booster(model_file=str(models_path / "gbdt_model.txt"))
     gbdt_prob = train_gbdt.score_with_gbdt(gbdt_model, features_df, cols=gbdt_cols)
 
-    lookup = load_entity_lookup(repo_root, "train")
-    print("[ensemble] scoring every candidate pair with the fine-tuned Laya Router "
-          f"({len(features_df)} pairs, batch_size={laya_batch_size})...")
+    table = load_entity_table(repo_root, "train")
+    shortlist = laya_shortlist_mask(features_df, gbdt_prob, laya_top_n, laya_min_gbdt_prob)
     router = build_router(repo_root)
-    laya_prob = score_with_laya(router, features_df, lookup, batch_size=laya_batch_size)
+    laya_prob = score_with_laya(router, features_df, table, shortlist, batch_size=laya_batch_size)
 
-    stack_df = build_stack_frame(features_df, gbdt_prob, laya_prob, gbdt_cols)
+    stack_df = build_stack_frame(features_df, gbdt_prob, laya_prob, shortlist, gbdt_cols)
     cols = stack_columns(gbdt_cols)
-
     X_train, y_train = stack_df[train_mask][cols], labels[train_mask]
     X_val, y_val = stack_df[val_mask][cols], labels[val_mask]
-    print(f"[ensemble] stacking on {len(cols)} columns ({len(gbdt_cols)} base features + "
-          f"gbdt_prob + laya_prob): {X_train.shape[0]} train / {X_val.shape[0]} val rows")
+    print(f"[ensemble] stacking on {len(cols)} columns: {X_train.shape[0]} train / {X_val.shape[0]} val rows")
 
     lr_model = train_logistic_stacker(X_train, y_train)
     gbdt_alt_model = train_shallow_gbdt_stacker(X_train, y_train, X_val, y_val, cols, seed=seed)
 
-    results = {}
+    pairs_val = features_df.loc[val_mask, ["source1_entity_id", "candidate_entity_id"]].reset_index(drop=True)
+    gbdt_only = best_threshold(pairs_val, gbdt_prob[val_mask], truth, val_ids)
+    results = {"gbdt_only_baseline": {"threshold_sweep": gbdt_only}}
+    print(f"[ensemble] GBDT-only baseline: best threshold={gbdt_only['best']['threshold']} "
+          f"macro_F0.5={gbdt_only['best']['macro_f0_5']:.4f}")
+
     for name, model, kind in (("logistic", lr_model, "logistic"), ("gbdt_alt", gbdt_alt_model, "gbdt")):
         val_scores = score_stack(model, kind, X_val)
-        pairs_val = features_df[val_mask][["source1_entity_id", "candidate_entity_id"]].reset_index(drop=True)
         threshold_report = best_threshold(pairs_val, val_scores, truth, val_ids)
         breakdown = breakdown_report(pairs_val, val_scores, threshold_report["best"]["threshold"],
-                                      truth, val_ids, lookup)
+                                     truth, val_ids, table)
         results[name] = {"threshold_sweep": threshold_report, "breakdown": breakdown}
         print(f"[ensemble] {name}: best threshold={threshold_report['best']['threshold']} "
               f"macro_F0.5={threshold_report['best']['macro_f0_5']:.4f}")
         print(json.dumps(breakdown, indent=2))
 
-    import joblib
     joblib.dump(lr_model, models_path / "ensemble_lr.joblib")
     gbdt_alt_model.save_model(str(models_path / "ensemble_gbdt_alt.txt"),
-                               num_iteration=gbdt_alt_model.best_iteration)
+                              num_iteration=gbdt_alt_model.best_iteration)
     with open(models_path / "ensemble_stack_columns.json", "w") as f:
         json.dump(cols, f, indent=2)
     with open(models_path / "ensemble_threshold.json", "w") as f:
-        json.dump({name: r["threshold_sweep"]["best"]["threshold"] for name, r in results.items()}, f, indent=2)
+        json.dump({name: results[name]["threshold_sweep"]["best"]["threshold"]
+                   for name in ("logistic", "gbdt_alt")}, f, indent=2)
+    with open(models_path / "ensemble_config.json", "w") as f:
+        json.dump({"laya_top_n": laya_top_n, "laya_min_gbdt_prob": laya_min_gbdt_prob}, f, indent=2)
     report_path = common.data_processed_dir(repo_root) / "ensemble_val_report.json"
     with open(report_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"[ensemble] wrote {models_path / 'ensemble_lr.joblib'}, "
-          f"{models_path / 'ensemble_gbdt_alt.txt'}, {report_path}")
-    print("[ensemble] NOTE: 'logistic' is the primary/interpretable option per the challenge "
-          "write-up; 'gbdt_alt' is provided to compare. Pick whichever scores higher macro F_0.5 "
-          "on this val report for predict.py's --stack-model flag -- decide that on the GPU "
-          "machine's real numbers, not here.")
+    print(f"[ensemble] wrote models + {report_path}. Compare 'logistic'/'gbdt_alt' against "
+          f"'gbdt_only_baseline' before trusting that Laya helped.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     common.add_repo_root_arg(parser)
     parser.add_argument("--features", type=str, default=None,
-                         help="Path to features_train.parquet. Default: data_processed/features_train.parquet")
+                        help="Path to features_train.parquet. Default: data_processed/features_train.parquet")
     parser.add_argument("--val-frac", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--laya-batch-size", type=int, default=64)
+    parser.add_argument("--laya-top-n", type=int, default=LAYA_TOP_N)
+    parser.add_argument("--laya-min-gbdt-prob", type=float, default=LAYA_MIN_GBDT_PROB)
     args = parser.parse_args()
-    run(args.repo_root, args.features, args.val_frac, args.seed, args.laya_batch_size)
+    run(args.repo_root, args.features, args.val_frac, args.seed, args.laya_batch_size,
+        args.laya_top_n, args.laya_min_gbdt_prob)
 
 
 if __name__ == "__main__":
