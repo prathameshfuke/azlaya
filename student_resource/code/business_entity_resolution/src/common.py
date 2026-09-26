@@ -88,19 +88,26 @@ def models_dir(repo_root: Path) -> Path:
 _READ_CHUNK_ROWS = 200_000
 
 
-def _read_tsv_with_progress(path) -> pd.DataFrame:
+def _read_tsv_with_progress(path, columns=None, ids=None) -> pd.DataFrame:
     """Every column as `str`, no NaN coercion (an empty field stays ""), read in chunks so large
-    files show a live row count instead of a silent multi-minute pause."""
+    files show a live row count instead of a silent multi-minute pause. `columns` limits which
+    columns are kept and `ids` which entity_id rows are kept; at ~12.5M train records, loading
+    only what a step needs is the difference between fitting in memory and not."""
     from tqdm.auto import tqdm
 
     path = Path(path)
     chunks = []
     with tqdm(desc=f"read {path.name}", unit="row", unit_scale=True, mininterval=1.0) as bar:
         for chunk in pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, na_filter=False,
-                                 chunksize=_READ_CHUNK_ROWS):
-            chunks.append(chunk)
+                                 usecols=columns, chunksize=_READ_CHUNK_ROWS):
             bar.update(len(chunk))
-    df = pd.concat(chunks, ignore_index=True) if chunks else pd.read_csv(path, sep="\t", dtype=str)
+            if ids is not None:
+                chunk = chunk[chunk["entity_id"].isin(ids)]
+            chunks.append(chunk)
+    if chunks:
+        df = pd.concat(chunks, ignore_index=True)
+    else:
+        df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, usecols=columns, nrows=0)
     df.columns = [c.strip() for c in df.columns]
     return df
 
@@ -127,20 +134,30 @@ def normalized_path(repo_root: Path, split: str, key: str) -> Path:
     return data_processed_dir(repo_root) / f"{split}_{key}_normalized.tsv"
 
 
-def load_normalized(repo_root: Path, split: str, key: str) -> pd.DataFrame:
+def load_normalized(repo_root: Path, split: str, key: str, columns=None, ids=None) -> pd.DataFrame:
     return _read_tsv_with_progress(require(normalized_path(repo_root, split, key),
-                                           f"normalize.py (notebook Section 1) for --split {split}"))
+                                           f"normalize.py (notebook Section 1) for --split {split}"),
+                                   columns=columns, ids=ids)
+
+
+def sampled_ground_truth(repo_root: Path, candidates_path=None) -> pd.DataFrame:
+    """Train ground truth restricted to the S1 entities blocking sampled (every sampled S1 has a
+    row in candidate_pairs_train.tsv, even with no candidates). Train, Laya, ensemble and the
+    recall report all use this, so "val" and every metric refer to the same sampled entities --
+    an unsampled entity would otherwise count as an empty prediction and skew F_0.5."""
+    candidates_path = candidates_path or (data_processed_dir(repo_root) / "candidate_pairs_train.tsv")
+    sampled = set(pd.read_csv(require(candidates_path, "blocking.py --split train (notebook Section 2)"),
+                              sep="\t", dtype=str, usecols=["source1_entity_id"], keep_default_na=False)
+                  ["source1_entity_id"])
+    gt = read_source_tsv(require(dataset_dir(repo_root, "train") / SOURCE_FILENAMES["train"]["ground_truth"],
+                                 "the dataset setup (notebook Section 0.3)"))
+    return gt[gt["source1_entity_id"].isin(sampled)].reset_index(drop=True)
 
 
 def write_normalized(df: pd.DataFrame, repo_root: Path, split: str, key: str) -> Path:
     path = normalized_path(repo_root, split, key)
     df.to_csv(path, sep="\t", index=False)
     return path
-
-
-def load_all_normalized(repo_root: Path, split: str) -> Dict[str, pd.DataFrame]:
-    out = {key: load_normalized(repo_root, split, key) for key in SOURCE_KEYS}
-    return out
 
 
 # ------------------------------------------------------- id-list TSV (the submission-file format)

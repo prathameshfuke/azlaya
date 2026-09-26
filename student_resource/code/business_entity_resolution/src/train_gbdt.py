@@ -58,7 +58,7 @@ def label_pairs(features_df: pd.DataFrame, ground_truth: pd.DataFrame) -> pd.Ser
 def build_dataset(repo_root, features_path):
     features_path = features_path or (common.data_processed_dir(repo_root) / "features_train.parquet")
     features_df = pd.read_parquet(common.require(features_path, "features.py (notebook Section 3)"))
-    ground_truth = common.load_split_sources(repo_root, "train")["ground_truth"]
+    ground_truth = common.sampled_ground_truth(repo_root)
     labels = label_pairs(features_df, ground_truth)
     return features_df, labels, ground_truth
 

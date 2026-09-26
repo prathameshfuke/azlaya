@@ -31,7 +31,7 @@ from tqdm.auto import tqdm
 
 from src import common
 from src import train_gbdt
-from src.features import load_entity_table
+from src.features import load_entity_table, pair_entity_ids
 from src.laya_finetune import SAME_ENTITY_CRITERIA, SAME_ENTITY_INSTRUCTIONS, build_routers
 
 DEFAULT_THRESHOLDS = [round(t, 2) for t in np.arange(0.05, 0.96, 0.05)]
@@ -209,19 +209,34 @@ def breakdown_report(pairs_df: pd.DataFrame, scores: np.ndarray, threshold: floa
 # --------------------------------------------------------------------------------------- driver
 
 def run(repo_root: Path, features_path, val_frac: float, seed: int, laya_batch_size: int,
-        laya_top_n: int, laya_min_gbdt_prob: float):
+        laya_top_n: int, laya_min_gbdt_prob: float, max_entities: int = 60_000):
+    """The stacker trains ONLY on the GBDT's held-out val entities (split in half: stack-train /
+    stack-eval). On the GBDT's own training entities gbdt_prob is overfit -- the model has seen
+    those labels -- so a stacker fit there learns to over-trust it. Laya fine-tuning also only
+    used train-pool entities, so neither input is overfit on these rows. `max_entities` caps how
+    many val entities are used (Laya scoring is the slow part)."""
     import joblib
     import lightgbm as lgb
 
     features_path = features_path or (common.data_processed_dir(repo_root) / "features_train.parquet")
     features_df = pd.read_parquet(common.require(features_path, "features.py (notebook Section 3)"))
-    ground_truth = common.load_split_sources(repo_root, "train")["ground_truth"]
+    ground_truth = common.sampled_ground_truth(repo_root)
     truth = common.ground_truth_map(ground_truth)
-    labels = train_gbdt.label_pairs(features_df, ground_truth).astype(int).to_numpy()
 
-    train_ids, val_ids = common.stratified_split_by_s1(ground_truth, val_frac=val_frac, seed=seed)
-    train_mask = features_df["source1_entity_id"].isin(train_ids).to_numpy()
-    val_mask = features_df["source1_entity_id"].isin(val_ids).to_numpy()
+    # Same split as train_gbdt.py, so these are entities the GBDT never trained on.
+    _, gbdt_val_ids = common.stratified_split_by_s1(ground_truth, val_frac=val_frac, seed=seed)
+    val_gt = ground_truth[ground_truth["source1_entity_id"].isin(gbdt_val_ids)]
+    if max_entities and len(val_gt) > max_entities:
+        val_gt = val_gt.sample(n=max_entities, random_state=seed)
+    stack_train_ids, stack_eval_ids = common.stratified_split_by_s1(val_gt, val_frac=0.5, seed=seed + 2)
+    print(f"[ensemble] stacking on GBDT-held-out entities only: {len(stack_train_ids)} stack-train / "
+          f"{len(stack_eval_ids)} stack-eval S1 entities")
+
+    features_df = features_df[features_df["source1_entity_id"].isin(stack_train_ids | stack_eval_ids)]
+    features_df = features_df.reset_index(drop=True)
+    labels = train_gbdt.label_pairs(features_df, ground_truth).astype(int).to_numpy()
+    train_mask = features_df["source1_entity_id"].isin(stack_train_ids).to_numpy()
+    eval_mask = features_df["source1_entity_id"].isin(stack_eval_ids).to_numpy()
 
     models_path = common.models_dir(repo_root)
     with open(common.require(models_path / "gbdt_feature_columns.json", "train_gbdt.py (notebook Section 4)")) as f:
@@ -229,31 +244,35 @@ def run(repo_root: Path, features_path, val_frac: float, seed: int, laya_batch_s
     gbdt_model = lgb.Booster(model_file=str(models_path / "gbdt_model.txt"))
     gbdt_prob = train_gbdt.score_with_gbdt(gbdt_model, features_df, cols=gbdt_cols)
 
-    table = load_entity_table(repo_root, "train")
+    table = load_entity_table(repo_root, "train", ids=pair_entity_ids(features_df))
     shortlist = laya_shortlist_mask(features_df, gbdt_prob, laya_top_n, laya_min_gbdt_prob)
     routers = build_routers(repo_root)
     laya_prob = score_with_laya(routers, features_df, table, shortlist, batch_size=laya_batch_size)
+    del routers
 
     stack_df = build_stack_frame(features_df, gbdt_prob, laya_prob, shortlist, gbdt_cols)
     cols = stack_columns(gbdt_cols)
     X_train, y_train = stack_df[train_mask][cols], labels[train_mask]
-    X_val, y_val = stack_df[val_mask][cols], labels[val_mask]
-    print(f"[ensemble] stacking on {len(cols)} columns: {X_train.shape[0]} train / {X_val.shape[0]} val rows")
+    X_eval, y_eval = stack_df[eval_mask][cols], labels[eval_mask]
+    print(f"[ensemble] {len(cols)} stacking columns: {X_train.shape[0]} stack-train / {X_eval.shape[0]} stack-eval rows")
 
     lr_model = train_logistic_stacker(X_train, y_train)
-    gbdt_alt_model = train_shallow_gbdt_stacker(X_train, y_train, X_val, y_val, cols, seed=seed)
+    gbdt_alt_model = train_shallow_gbdt_stacker(X_train, y_train, X_eval, y_eval, cols, seed=seed)
 
-    pairs_val = features_df.loc[val_mask, ["source1_entity_id", "candidate_entity_id"]].reset_index(drop=True)
-    gbdt_only = best_threshold(pairs_val, gbdt_prob[val_mask], truth, val_ids)
-    results = {"gbdt_only_baseline": {"threshold_sweep": gbdt_only}}
+    pairs_eval = features_df.loc[eval_mask, ["source1_entity_id", "candidate_entity_id"]].reset_index(drop=True)
+    gbdt_only = best_threshold(pairs_eval, gbdt_prob[eval_mask], truth, stack_eval_ids)
+    results = {"gbdt_only_baseline": {
+        "threshold_sweep": gbdt_only,
+        "breakdown": breakdown_report(pairs_eval, gbdt_prob[eval_mask], gbdt_only["best"]["threshold"],
+                                      truth, stack_eval_ids, table)}}
     print(f"[ensemble] GBDT-only baseline: best threshold={gbdt_only['best']['threshold']} "
           f"macro_F0.5={gbdt_only['best']['macro_f0_5']:.4f}")
 
     for name, model, kind in (("logistic", lr_model, "logistic"), ("gbdt_alt", gbdt_alt_model, "gbdt")):
-        val_scores = score_stack(model, kind, X_val)
-        threshold_report = best_threshold(pairs_val, val_scores, truth, val_ids)
-        breakdown = breakdown_report(pairs_val, val_scores, threshold_report["best"]["threshold"],
-                                     truth, val_ids, table)
+        eval_scores = score_stack(model, kind, X_eval)
+        threshold_report = best_threshold(pairs_eval, eval_scores, truth, stack_eval_ids)
+        breakdown = breakdown_report(pairs_eval, eval_scores, threshold_report["best"]["threshold"],
+                                     truth, stack_eval_ids, table)
         results[name] = {"threshold_sweep": threshold_report, "breakdown": breakdown}
         print(f"[ensemble] {name}: best threshold={threshold_report['best']['threshold']} "
               f"macro_F0.5={threshold_report['best']['macro_f0_5']:.4f}")
@@ -266,7 +285,7 @@ def run(repo_root: Path, features_path, val_frac: float, seed: int, laya_batch_s
         json.dump(cols, f, indent=2)
     with open(models_path / "ensemble_threshold.json", "w") as f:
         json.dump({name: results[name]["threshold_sweep"]["best"]["threshold"]
-                   for name in ("logistic", "gbdt_alt")}, f, indent=2)
+                   for name in ("gbdt_only_baseline", "logistic", "gbdt_alt")}, f, indent=2)
     with open(models_path / "ensemble_config.json", "w") as f:
         json.dump({"laya_top_n": laya_top_n, "laya_min_gbdt_prob": laya_min_gbdt_prob}, f, indent=2)
     report_path = common.data_processed_dir(repo_root) / "ensemble_val_report.json"
@@ -286,9 +305,11 @@ def main():
     parser.add_argument("--laya-batch-size", type=int, default=LAYA_BATCH_SIZE)
     parser.add_argument("--laya-top-n", type=int, default=LAYA_TOP_N)
     parser.add_argument("--laya-min-gbdt-prob", type=float, default=LAYA_MIN_GBDT_PROB)
+    parser.add_argument("--max-entities", type=int, default=60_000,
+                        help="Cap on GBDT-held-out S1 entities used for stacking (0 = all).")
     args = parser.parse_args()
     run(args.repo_root, args.features, args.val_frac, args.seed, args.laya_batch_size,
-        args.laya_top_n, args.laya_min_gbdt_prob)
+        args.laya_top_n, args.laya_min_gbdt_prob, args.max_entities)
 
 
 if __name__ == "__main__":

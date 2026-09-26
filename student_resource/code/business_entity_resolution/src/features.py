@@ -47,17 +47,23 @@ FEATURE_COLUMNS = [
 
 # --------------------------------------------------------------------------------- entity lookup
 
-def load_entity_table(repo_root, split: str) -> pd.DataFrame:
-    """All normalized S1/S2/S3 records in one frame indexed by entity_id (IDs are globally unique
-    by prefix)."""
-    frames = [common.load_normalized(repo_root, split, key)[ENTITY_COLS] for key in common.SOURCE_KEYS]
+def load_entity_table(repo_root, split: str, ids=None) -> pd.DataFrame:
+    """Normalized S1/S2/S3 records in one frame indexed by entity_id (IDs are globally unique by
+    prefix). Pass `ids` to keep only the records a step references -- the full train split is
+    ~12.5M records, far more than any single step needs in memory."""
+    ids = set(ids) if ids is not None else None
+    frames = [common.load_normalized(repo_root, split, key, columns=ENTITY_COLS, ids=ids)
+              for key in common.SOURCE_KEYS]
     return pd.concat(frames, ignore_index=True).set_index("entity_id")
 
 
-def load_entity_lookup(repo_root, split: str) -> Dict[str, dict]:
-    """entity_id -> record dict. Only for the (smaller) train split's Laya dataset build; the
-    feature/scoring paths use load_entity_table instead."""
-    return load_entity_table(repo_root, split).to_dict("index")
+def pair_entity_ids(pairs_df: pd.DataFrame) -> set:
+    return set(pairs_df["source1_entity_id"]).union(pairs_df["candidate_entity_id"])
+
+
+def load_entity_lookup(repo_root, split: str, ids) -> Dict[str, dict]:
+    """entity_id -> record dict for just `ids` (the Laya fine-tuning examples' records)."""
+    return load_entity_table(repo_root, split, ids=ids).to_dict("index")
 
 
 def build_pairs_frame(candidate_map) -> pd.DataFrame:
@@ -181,7 +187,7 @@ def run(repo_root, split: str, candidates_path, out_path):
     pairs_df = build_pairs_frame(candidate_map)
     print(f"[features] {split}: {len(candidate_map)} S1 entities, {len(pairs_df)} candidate pairs")
 
-    table = load_entity_table(repo_root, split)
+    table = load_entity_table(repo_root, split, ids=pair_entity_ids(pairs_df))
     features_df = compute_features(pairs_df, table)
 
     out_path = out_path or (common.data_processed_dir(repo_root) / f"features_{split}.parquet")

@@ -142,9 +142,21 @@ def read_jsonl(path: Path) -> List[dict]:
 
 # ------------------------------------------------------------------------------------- prepare
 
+def _cap(ids, limit: int, seed: int) -> set:
+    ids = sorted(ids)
+    if limit and len(ids) > limit:
+        ids = random.Random(seed).sample(ids, limit)
+    return set(ids)
+
+
 def stage_prepare(repo_root: Path, candidates_path, val_frac: float, calib_frac: float, seed: int,
-                  max_negatives_per_entity: int):
-    ground_truth = common.load_split_sources(repo_root, "train")["ground_truth"]
+                  max_negatives_per_entity: int, max_finetune_entities: int = 6000,
+                  max_calib_entities: int = 1000):
+    """max_finetune_entities: the upstream recipe fine-tunes on ~6k items in minutes on 2xT4;
+    6000 entities x (positives + 3 negatives) x 2 orderings is ~60-80k examples, roughly an hour
+    per role. Raise it if you have GPU time to spare."""
+    candidates_path = candidates_path or (common.data_processed_dir(repo_root) / "candidate_pairs_train.tsv")
+    ground_truth = common.sampled_ground_truth(repo_root, candidates_path)
     truth = common.ground_truth_map(ground_truth)
     train_ids, val_ids = common.stratified_split_by_s1(ground_truth, val_frac=val_frac, seed=seed)
     print(f"[laya_finetune/prepare] {len(train_ids)} train-pool / {len(val_ids)} held-out-val S1 "
@@ -154,12 +166,17 @@ def stage_prepare(repo_root: Path, candidates_path, val_frac: float, calib_frac:
     # not the same split as train_gbdt's/ensemble's val split.
     train_gt = ground_truth[ground_truth["source1_entity_id"].isin(train_ids)]
     finetune_ids, calib_ids = common.stratified_split_by_s1(train_gt, val_frac=calib_frac, seed=seed + 1)
-    print(f"[laya_finetune/prepare] of the train pool: {len(finetune_ids)} fine-tune / "
-          f"{len(calib_ids)} calibration S1 entities")
+    finetune_ids = _cap(finetune_ids, max_finetune_entities, seed)
+    calib_ids = _cap(calib_ids, max_calib_entities, seed + 1)
+    print(f"[laya_finetune/prepare] using {len(finetune_ids)} fine-tune / {len(calib_ids)} calibration "
+          f"S1 entities (capped)")
 
-    candidates_path = candidates_path or (common.data_processed_dir(repo_root) / "candidate_pairs_train.tsv")
-    candidate_map = common.read_id_list_tsv(common.require(candidates_path, "blocking.py (notebook Section 2)"))
-    lookup = load_entity_lookup(repo_root, "train")
+    candidate_map = common.read_id_list_tsv(candidates_path)
+    chosen = finetune_ids | calib_ids
+    needed_ids = set(chosen)
+    for s1 in chosen:
+        needed_ids.update(candidate_map.get(s1, ()))
+    lookup = load_entity_lookup(repo_root, "train", needed_ids)
 
     finetune_examples = build_examples(candidate_map, lookup, truth, finetune_ids, max_negatives_per_entity, seed)
     calib_examples = build_examples(candidate_map, lookup, truth, calib_ids, max_negatives_per_entity, seed + 1)
@@ -530,6 +547,8 @@ def main():
     parser.add_argument("--calib-frac", type=float, default=0.15,
                          help="[prepare] Fraction of the TRAIN pool (not val) carved out for "
                               "Laya's post-training calibration fit.")
+    parser.add_argument("--max-finetune-entities", type=int, default=6000,
+                         help="[prepare] S1 entities used for fine-tuning examples (0 = all).")
     parser.add_argument("--max-negatives-per-entity", type=int, default=3,
                          help="[prepare] Hard negatives kept per S1 entity (all positives are kept).")
     # train
@@ -546,7 +565,7 @@ def main():
 
     if args.stage == "prepare":
         stage_prepare(args.repo_root, args.candidates, args.val_frac, args.calib_frac, args.seed,
-                      args.max_negatives_per_entity)
+                      args.max_negatives_per_entity, args.max_finetune_entities)
     else:
         if not args.role:
             raise SystemExit("--stage train requires --role {english,multilingual}")

@@ -267,12 +267,21 @@ def normalize_frame(df: pd.DataFrame, label: str = "", workers: int = None) -> p
     return pd.DataFrame(out, columns=_OUTPUT_COLS)
 
 
-def run(repo_root, splits):
+def run(repo_root, splits, skip_existing: bool = False):
+    """skip_existing: reuse normalized files already on disk (e.g. from a previous Kaggle session)
+    instead of recomputing them. Only safe if they were produced by the current normalize.py."""
     for split in splits:
-        sources = common.load_split_sources(repo_root, split)
         for key in common.SOURCE_KEYS:
-            print(f"[normalize] {split}/{key}: {len(sources[key])} rows")
-            normalized = normalize_frame(sources[key], label=f"{split}/{key}")
+            if skip_existing and common.normalized_path(repo_root, split, key).exists():
+                print(f"[normalize] {split}/{key}: reusing existing {common.normalized_path(repo_root, split, key)}")
+                continue
+            # one source at a time: holding all three raw splits at once needlessly doubles peak memory
+            raw = common.read_source_tsv(common.require(
+                common.dataset_dir(repo_root, split) / common.SOURCE_FILENAMES[split][key],
+                "the dataset setup (notebook Section 0.3)"))
+            print(f"[normalize] {split}/{key}: {len(raw)} rows")
+            normalized = normalize_frame(raw, label=f"{split}/{key}")
+            del raw
             out_path = common.write_normalized(normalized, repo_root, split, key)
             print(f"[normalize]   -> {out_path}")
 

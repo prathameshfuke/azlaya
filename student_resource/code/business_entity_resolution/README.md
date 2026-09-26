@@ -1,150 +1,103 @@
 # Business Entity Resolution -- pipeline
 
 Blocking + GBDT + fine-tuned Laya, stacked, for the ML Challenge 2026 Business Entity Resolution
-task. **Every script under `src/` was written on a machine with no GPU and has never been run.**
-Nothing here has been executed, trained, or validated end-to-end -- run the steps below yourself,
-in order, on a GPU machine (Colab / Kaggle / AWS), and read each script's own module docstring for
-what it does and does not verify. Several places are flagged in code comments as
-"NEEDS GPU-MACHINE VERIFICATION" -- treat those as a checklist, not an afterthought.
+task. Produces `output/candidate_pairs.tsv` and `output/matching_results.tsv`.
 
-**Prefer a notebook?** `notebooks/run_pipeline_colab_kaggle.ipynb` runs every step below,
-block by block, in a Colab- or Kaggle-ready notebook -- it shells out to the same `src/` scripts
-(nothing is reimplemented inline), plus cells for cloning the repo, providing the dataset,
-peeking at intermediate output between stages, and packaging the final submission zip. The
-command-by-command version below is the same run order, for anyone who'd rather work from a
-terminal or a different GPU host (e.g. AWS).
+## Easiest way to run: the notebook
+
+`notebooks/run_pipeline_colab_kaggle.ipynb` is self-contained: it writes every file in `src/`
+(plus this README, `requirements.txt`, the challenge's `validate_submission.py` and
+`Documentation_template.md`) from `%%writefile` cells, then runs each step in-kernel with live
+progress bars. Upload it to Kaggle, attach the dataset, choose **GPU T4 x2**, and run top to bottom.
+Nothing is cloned at runtime.
+
+The notebook is generated from `src/` by `notebooks/build_notebook.py`. After editing anything in
+`src/`, regenerate it from this directory with `python notebooks/build_notebook.py`.
 
 ## Layout
-
-This folder (`code/business_entity_resolution/`) is a self-contained copy of the pipeline, matching
-the required final-submission zip structure. It expects to sit inside the challenge's
-`student_resource/` directory, alongside `dataset/` and `utils/`:
 
 ```
 student_resource/
 ├── dataset/{train,test}/...
 ├── utils/validate_submission.py
-├── output/                  <- created by blocking.py / predict.py
-├── data_processed/          <- created by normalize.py / features.py / laya_finetune.py
-├── models/                  <- created by train_gbdt.py / laya_finetune.py / ensemble.py
+├── output/                  <- candidate_pairs.tsv, matching_results.tsv (predict.py)
+├── data_processed/          <- normalized TSVs, candidate/feature tables, Laya datasets, reports
+├── models/                  <- GBDT, fine-tuned Laya checkpoints, ensemble stackers
 └── code/business_entity_resolution/
     ├── src/*.py
+    ├── notebooks/
     ├── requirements.txt
     └── README.md   (this file)
 ```
 
-Every script auto-detects `student_resource/` as three directories up from `src/` and defaults
-`--repo-root` to it; pass `--repo-root /some/other/path` to override (e.g. if you copy just this
-folder somewhere else on the GPU machine and keep `dataset/` elsewhere).
+Scripts auto-detect `student_resource/` as three directories up from `src/` (`--repo-root`
+overrides). Run CLI commands **from this directory** so `python -m src.<script>` resolves.
 
-All commands below are run **from this directory** (`code/business_entity_resolution/`) so that
-`python -m src.<script>` resolves the `src` package correctly.
-
-## Setup (GPU machine)
+## Command-line run order (alternative to the notebook)
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-```
 
-`laya_finetune.py` downloads two checkpoints from Hugging Face Hub on first use
-(`convaiinnovations/laya`, `convaiinnovations/laya-multilingual`) -- needs network access. Both are
-Apache-2.0 licensed and well under the challenge's 8B-parameter cap (421M / 322M).
-
-## Run order
-
-```bash
-# 1. Normalize all six source files
 python -m src.normalize --split train --split test
-
-# 2. Blocking / candidate generation
-#    - train candidates feed features.py (for GBDT + Laya training) and blocking's own recall report
-python -m src.blocking --split train --k 30 --out ../../data_processed/candidate_pairs_train.tsv --report-recall
-#    - test candidates: predict.py (step 7) regenerates these itself into output/candidate_pairs.tsv
-#      using the SAME blocking.generate_candidates() function, so running this standalone for test
-#      is only useful for inspecting blocking in isolation:
-python -m src.blocking --split test --k 30
-
-# 3. Feature engineering
+python -m src.blocking --split train --out ../../data_processed/candidate_pairs_train.tsv --report-recall
 python -m src.features --split train --candidates ../../data_processed/candidate_pairs_train.tsv
-
-# 4. GBDT matcher (trains + reports val precision/recall/macro F_0.5)
 python -m src.train_gbdt --features ../../data_processed/features_train.parquet
-
-# 5. Laya fine-tuning -- two stages, two roles
 python -m src.laya_finetune --stage prepare
-python -m src.laya_finetune --stage train --role english
-python -m src.laya_finetune --stage train --role multilingual
-#    On Kaggle 2xT4, launch each role with torchrun instead of `python -m` for DDP:
-#    torchrun --standalone --nproc_per_node=2 -m src.laya_finetune --stage train --role english
-#    torchrun --standalone --nproc_per_node=2 -m src.laya_finetune --stage train --role multilingual
-
-# 6. Ensemble: score with Laya, stack with GBDT features, refit threshold, report by country/singleton
+torchrun --standalone --nproc_per_node=2 -m src.laya_finetune --stage train --role english
+torchrun --standalone --nproc_per_node=2 -m src.laya_finetune --stage train --role multilingual
 python -m src.ensemble --features ../../data_processed/features_train.parquet
-
-# 7. Full test-set inference -> output/candidate_pairs.tsv + output/matching_results.tsv
-python -m src.predict --stack-model logistic
+python -m src.predict --stack-model logistic        # or gbdt_alt / gbdt_only, whichever ensemble.py reports best
 ```
 
-Step 6's printed report tells you whether `logistic` or `gbdt_alt` scored higher macro F_0.5 on
-the held-out val split -- pass whichever won to step 7's `--stack-model`.
+With a single GPU, use `python -m src.laya_finetune --stage train --role <role>` instead of
+`torchrun`.
 
-## 8. Validate before submitting
-
-Not run in this environment. From `student_resource/` (one level above this folder):
+Validate from `student_resource/`:
 
 ```bash
-python3 utils/validate_submission.py \
-    --matching output/matching_results.tsv \
-    --candidate output/candidate_pairs.tsv \
-    --test-dir dataset/test
+python3 utils/validate_submission.py --matching output/matching_results.tsv \
+    --candidate output/candidate_pairs.tsv --test-dir dataset/test
 ```
 
-## Design notes / where to look first if something's off
+## How it scales to the real data (~12.5M train records)
 
-- **Every S1 entity gets exactly one row, matches are a subset of candidates, no duplicate IDs**:
-  enforced structurally (`predict.py` seeds `matches` from every test S1 id up front;
-  `common.write_id_list_tsv` dedupes), not just hoped for -- but confirm with the validator above
-  before submitting, not by reading this bullet.
-- **Country is an open set everywhere**: `normalize.py`'s suffix-dictionary lookup and
-  `blocking.py`'s partitioning both key off *whatever* `country` values are present in the data
-  (`df.groupby("country")` / a two-way `country_suffix_group()` bucket for France vs.
-  everything-else), never a hardcoded `{US, India}` list. France only ever changes behavior in the
-  legal-suffix dictionary (`normalize.py`) and in `ensemble.py`'s country breakdown report.
-- **Splits are consistent across the whole pipeline**: `train_gbdt.py`, `laya_finetune.py`'s
-  calibration slice, and `ensemble.py` all call `common.stratified_split_by_s1` with the same
-  default `--val-frac 0.2 --seed 42`, so "val" means the same held-out S1 entities everywhere.
-  Laya's fine-tuning and calibration data is built ONLY from the remaining train pool
-  (`laya_finetune.py --stage prepare`), never from the val split those other scripts score against
-  -- change `--val-frac`/`--seed` in lockstep across scripts if you touch them, or the split
-  guarantee breaks silently.
-- **Blocking recall is the ceiling for everything downstream.** Run `blocking.py --report-recall`
-  first and look at `macro_entity_recall` before spending GPU time on GBDT/Laya training -- if it's
-  low, raising `--k` or trying `--score-method tfidf` is cheaper than anything downstream.
-- **Scale**: the full test set is large (validate_submission.py's own docstring notes ~1.7M
-  entities). `data_processed/*.parquet` is used for the feature table specifically because of this;
-  the normalized `data_processed/*.tsv` files stay plain TSV for consistency with the rest of the
-  challenge's file format, but converting them to parquet too is a straightforward follow-up if
-  `normalize.py`/`blocking.py` I/O becomes the bottleneck at full scale. `blocking.py`'s inverted
-  indices and `features.py`'s per-pair loops are correctness-first, not throughput-tuned; profile
-  before assuming they're fast enough at 1.7M rows.
-- **Laya's calibration is on hard 0/1 labels**, not a soft teacher distribution (see the comment in
-  `laya_finetune.py:make_example`) -- our ground truth doesn't have per-pair uncertainty to draw
-  soft targets from, unlike the benchmark the upstream fine-tuning notebook was built for. The RLCD
-  objective and post-hoc temperature fit still run correctly on one-hot targets; it just means less
-  signal about calibrated *uncertainty*, more about calibrated *confidence*.
-- **DBA / legal-vs-trade name matching, city_guess, and the DBA-pattern regex are all heuristics**
-  written against the challenge's documented noise patterns, not against real sample rows (none
-  were available to inspect in this environment). Each is flagged inline with a
-  "NEEDS GPU-MACHINE VERIFICATION" comment at the point it's defined in `normalize.py`
-  (`split_dba`, `guess_city`) -- print a sample of normalized rows and eyeball them before trusting
-  these as blocking/feature signals.
+- **Normalization** runs row-parallel across all CPU cores.
+- **Blocking** uses TF-IDF vectors (name character 4-grams; address words, which carry pin, city
+  and street) and a multithreaded sparse top-n matrix product (`sparse_dot_topn`), per country.
+  N-grams shared by more than 10k records are dropped. An earlier Python inverted-index version
+  exhausted Kaggle's 30 GB.
+- **Training uses a sample** of S1 entities (`--max-s1`, default 300k of ~2.2M). Their candidates
+  are still searched against the full S2/S3 pool, so hard negatives are realistic. Every training
+  step reads the sample back via `common.sampled_ground_truth`, so splits and metrics all refer to
+  the same entities. The test set is always processed in full.
+- **Features** are computed in 500k-pair chunks, loading only the records those pairs reference.
+- **Laya fine-tuning** uses `--max-finetune-entities` (default 6000) entities: all true matches
+  plus up to 3 hard negatives each, in both orderings. DDP across both T4s.
+- **Laya scoring** covers a shortlist (each S1's top 3 GBDT candidates with prob >= 0.05), with one
+  Router per GPU run in parallel.
+
+## Design notes
+
+- **Output format rules** (one row per S1, matches subset of candidates, no duplicate IDs) are
+  enforced structurally: `predict.py` seeds every test S1 id before filling matches, and
+  `common.write_id_list_tsv` dedupes. Still confirm with the validator.
+- **Country is an open set everywhere**: blocking partitions by whatever `country` values appear;
+  only the legal-suffix dictionary branches France vs. everything else.
+- **No leakage in stacking**: the GBDT trains on 80% of sampled entities. `ensemble.py` trains
+  its stacker only on the other 20% (the GBDT never saw them), halved into stack-train and
+  stack-eval. Laya fine-tuning uses only the GBDT's training pool, so `laya_prob` isn't overfit on
+  those entities either.
+- **GBDT-only fallback**: `ensemble.py` reports the GBDT-only baseline on the same stack-eval
+  entities. If the Laya ensemble doesn't beat it, run `predict.py --stack-model gbdt_only`, which
+  skips Laya entirely.
+- **Laya calibration uses hard 0/1 labels.** The ground truth has no per-pair uncertainty to use
+  as soft targets. The RLCD objective and post-hoc temperature fit still work on one-hot targets.
+- **Heuristics worth eyeballing on real rows**: DBA splitting and `guess_city` in `normalize.py`.
 
 ## What this pipeline does NOT do
 
-- No external data, API, or lookup of any kind (geocoding, business registries, etc.) -- the
-  challenge explicitly prohibits this; nothing here calls out to anything but Hugging Face Hub for
-  the two base Laya checkpoints.
-- No hyperparameter search: LightGBM params in `train_gbdt.py` and the RLCD hyperparameters in
-  `laya_finetune.py` (epochs, learning rates, sigma schedule) are the notebook's / a reasonable
-  starting point, exposed as CLI flags, not tuned against any actual score (there is none yet).
+- No external data, API, or lookup of any kind (geocoding, business registries, etc.). Nothing
+  here calls anything but Hugging Face Hub, to download the two base Laya checkpoints
+  (Apache-2.0, 421M / 322M parameters, under the 8B cap).
+- No hyperparameter search: LightGBM and RLCD settings are reasonable starting points exposed as
+  arguments, not tuned against a score.
