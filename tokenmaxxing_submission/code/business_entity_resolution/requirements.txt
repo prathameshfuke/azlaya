@@ -1,0 +1,16 @@
+# Python 3.11, CUDA 12 (tested on 8x V100 32 GB, 40 CPUs, 500 GB RAM)
+torch==2.5.1
+transformers==5.17.0
+faiss-gpu-cu12==1.14.1
+lightgbm==4.7.0
+xgboost==3.2.0
+catboost==1.2.10
+scikit-learn==1.9.1
+pandas==3.0.6
+numpy==2.4.6
+pyarrow
+rapidfuzz==3.14.6
+indic-transliteration
+reportlab
+pypdfium2
+matplotlib
