@@ -154,9 +154,25 @@ def sampled_ground_truth(repo_root: Path, candidates_path=None) -> pd.DataFrame:
     return gt[gt["source1_entity_id"].isin(sampled)].reset_index(drop=True)
 
 
+def _tmp_path(path: Path) -> Path:
+    return path.with_name(path.name + ".tmp")
+
+
+# Every step's output is written to <name>.tmp and renamed into place when complete, so a step
+# killed mid-write (session timeout, OOM) never leaves a truncated file that looks finished --
+# which is what lets the notebook's resume mode trust "file exists" as "step done".
 def write_normalized(df: pd.DataFrame, repo_root: Path, split: str, key: str) -> Path:
     path = normalized_path(repo_root, split, key)
-    df.to_csv(path, sep="\t", index=False)
+    df.to_csv(_tmp_path(path), sep="\t", index=False)
+    _tmp_path(path).replace(path)
+    return path
+
+
+def write_parquet_atomic(df: pd.DataFrame, path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_tmp_path(path), index=False)
+    _tmp_path(path).replace(path)
     return path
 
 
@@ -168,11 +184,12 @@ def write_id_list_tsv(mapping: Dict[str, Iterable[str]], path, id_col: str, list
     deduplicated, empty string (not "None"/"nan") for an entity with no matches."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
+    with open(_tmp_path(path), "w", encoding="utf-8", newline="") as f:
         f.write(f"{id_col}\t{list_col}\n")
         for s1_id, ids in mapping.items():
             id_list = sorted(set(ids))
             f.write(f"{s1_id}\t{','.join(id_list)}\n")
+    _tmp_path(path).replace(path)
 
 
 def read_id_list_tsv(path) -> Dict[str, Set[str]]:

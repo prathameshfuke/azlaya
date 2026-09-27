@@ -20,28 +20,50 @@ from src import blocking, common, ensemble, features, train_gbdt
 from src.laya_finetune import build_routers
 
 
+def gbdt_only_threshold(repo_root: Path) -> float:
+    """Best threshold from the GBDT's own held-out sweep (train_gbdt.py). Used for a GBDT-only
+    submission when ensemble.py hasn't run (its stack-eval threshold is preferred when it has)."""
+    report_path = common.require(common.data_processed_dir(repo_root) / "gbdt_val_report.json",
+                                 "train_gbdt.py (notebook Section 4)")
+    sweep = json.loads(report_path.read_text())["threshold_sweep"]
+    return float(max(sweep, key=lambda t: sweep[t]["macro_f0_5"]))
+
+
 def run(repo_root: Path, k: int, stack_model: str, laya_batch_size: int,
-        threshold_override: float):
+        threshold_override: float, reuse_cached: bool = True):
+    """reuse_cached: if an earlier run already blocked the test set and computed its features
+    (output/candidate_pairs.tsv + data_processed/features_test.parquet), reuse them -- they don't
+    depend on the model -- instead of repeating the slowest CPU steps."""
     import lightgbm as lgb
+    import pandas as pd
 
     models_path = common.models_dir(repo_root)
-
-    # ---- 1. blocking ----
-    s1_df, s2_df, s3_df = blocking.load_blocking_inputs(repo_root, "test")
-    all_s1_ids = list(s1_df["entity_id"])
-    print(f"[predict] blocking: {len(s1_df)} S1 test entities (all of them), k={k}")
-    candidate_map = blocking.generate_candidates(s1_df, s2_df, s3_df, k=k)
-    del s2_df, s3_df
     candidate_path = common.output_dir(repo_root) / "candidate_pairs.tsv"
-    common.write_id_list_tsv(candidate_map, candidate_path, "source1_entity_id", "candidate_entity_ids")
-    print(f"[predict] wrote {candidate_path} ({sum(len(v) for v in candidate_map.values())} pairs)")
+    features_cache = common.data_processed_dir(repo_root) / "features_test.parquet"
+    table = None
 
-    # ---- 2. features ----
-    pairs_df = features.build_pairs_frame(candidate_map)
-    del candidate_map
-    table = features.load_entity_table(repo_root, "test", ids=features.pair_entity_ids(pairs_df))
-    features_df = features.compute_features(pairs_df, table)
-    del pairs_df
+    if reuse_cached and candidate_path.exists() and features_cache.exists():
+        print(f"[predict] reusing test candidates ({candidate_path}) and features ({features_cache})")
+        all_s1_ids = list(common.load_normalized(repo_root, "test", "source1", columns=["entity_id"])["entity_id"])
+        features_df = pd.read_parquet(features_cache)
+    else:
+        # ---- 1. blocking ----
+        s1_df, s2_df, s3_df = blocking.load_blocking_inputs(repo_root, "test")
+        all_s1_ids = list(s1_df["entity_id"])
+        print(f"[predict] blocking: {len(s1_df)} S1 test entities (all of them), k={k}")
+        candidate_map = blocking.generate_candidates(s1_df, s2_df, s3_df, k=k)
+        del s1_df, s2_df, s3_df
+        common.write_id_list_tsv(candidate_map, candidate_path, "source1_entity_id", "candidate_entity_ids")
+        print(f"[predict] wrote {candidate_path} ({sum(len(v) for v in candidate_map.values())} pairs)")
+
+        # ---- 2. features ----
+        pairs_df = features.build_pairs_frame(candidate_map)
+        del candidate_map
+        table = features.load_entity_table(repo_root, "test", ids=features.pair_entity_ids(pairs_df))
+        features_df = features.compute_features(pairs_df, table)
+        del pairs_df
+        common.write_parquet_atomic(features_df, features_cache)
+        print(f"[predict] cached test features -> {features_cache}")
 
     if features_df.empty:
         print("[predict] WARNING: zero candidate pairs survived blocking -- every S1 test entity will "
@@ -65,6 +87,8 @@ def run(repo_root: Path, k: int, stack_model: str, laya_batch_size: int,
         with open(common.require(models_path / "ensemble_config.json", "ensemble.py (notebook Section 6)")) as f:
             cfg = json.load(f)
         shortlist = ensemble.laya_shortlist_mask(features_df, gbdt_prob, cfg["laya_top_n"], cfg["laya_min_gbdt_prob"])
+        if table is None:
+            table = features.load_entity_table(repo_root, "test", ids=features.pair_entity_ids(features_df))
         routers = build_routers(repo_root)
         laya_prob = ensemble.score_with_laya(routers, features_df, table, shortlist, batch_size=laya_batch_size)
         del routers
@@ -80,8 +104,12 @@ def run(repo_root: Path, k: int, stack_model: str, laya_batch_size: int,
     print(f"[predict] {stack_model} mean prob {final_prob.mean():.4f}")
 
     # ---- 6. threshold ----
+    ensemble_thresholds = models_path / "ensemble_threshold.json"
     if threshold_override is not None:
         threshold = threshold_override
+    elif stack_model == "gbdt_only" and not ensemble_thresholds.exists():
+        threshold = gbdt_only_threshold(repo_root)
+        print("[predict] ensemble.py hasn't run -- using the GBDT's own best held-out threshold")
     else:
         with open(common.require(models_path / "ensemble_threshold.json", "ensemble.py (notebook Section 6)")) as f:
             thresholds = json.load(f)
@@ -91,6 +119,10 @@ def run(repo_root: Path, k: int, stack_model: str, laya_batch_size: int,
     # ---- 7. matching_results.tsv (every S1 seeded first -> one row each; subset of candidates) ----
     matches = ensemble.predicted_sets(features_df, final_prob, threshold, all_s1_ids)
     _write_matches(repo_root, matches)
+    # Records which model produced output/, so the notebook's resume mode knows whether the
+    # current submission files are the final ones or the GBDT-only safety copy.
+    (common.data_processed_dir(repo_root) / "prediction_done.json").write_text(
+        json.dumps({"stack_model": stack_model, "threshold": float(threshold)}, indent=2))
 
 
 def _write_matches(repo_root: Path, matches):
@@ -109,8 +141,11 @@ def main():
     parser.add_argument("--laya-batch-size", type=int, default=ensemble.LAYA_BATCH_SIZE)
     parser.add_argument("--threshold", type=float, default=None,
                         help="Override the threshold saved by ensemble.py.")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Recompute test blocking + features even if a previous run cached them.")
     args = parser.parse_args()
-    run(args.repo_root, args.k, args.stack_model, args.laya_batch_size, args.threshold)
+    run(args.repo_root, args.k, args.stack_model, args.laya_batch_size, args.threshold,
+        reuse_cached=not args.no_cache)
 
 
 if __name__ == "__main__":

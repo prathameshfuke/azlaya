@@ -76,6 +76,17 @@ python3 utils/validate_submission.py --matching output/matching_results.tsv \
 - **Laya scoring** covers a shortlist (each S1's top 3 GBDT candidates with prob >= 0.05), with one
   Router per GPU run in parallel.
 
+## Resuming an interrupted run
+
+Every step writes its output atomically (`<file>.tmp`, renamed when complete), so "the file
+exists" reliably means "the step finished". With `RESUME = True` (notebook Section 0.6), Run All
+skips finished steps. Laya fine-tuning (`laya_finetune.py --stage train`) resumes from
+`models/laya_<role>/checkpoint_latest/`, saved every `--checkpoint-every-updates` optimizer
+updates and at each epoch end, mid-epoch included (same batch order, LR schedule
+fast-forwarded). It skips a role that's already finished (`rl_agent_config.json` present), and
+`--max-hours` stops cleanly after a checkpoint. `predict.py` caches the test candidates and
+features, so a GBDT-only safety submission (notebook 4b) costs nothing extra later.
+
 ## Design notes
 
 - **Output format rules** (one row per S1, matches subset of candidates, no duplicate IDs) are

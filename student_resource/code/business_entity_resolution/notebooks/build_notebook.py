@@ -63,6 +63,16 @@ model copy per GPU in parallel.
 
 Run cells **top to bottom**; each step reads what the previous one wrote. Every step checks its
 inputs and names the earlier step to re-run if something is missing.
+
+**Resuming after an interruption** (session timeout, crash, closed tab): just **Run All** again.
+With `RESUME = True` (Section 0.6, the default) every step whose output already exists is skipped
+in seconds, and Laya fine-tuning continues from its last checkpoint (saved every ~200 updates and
+at each epoch end), mid-epoch included. Section 0.6 prints exactly what's done. Don't run a single
+later cell on its own after a restart: the setup cells in Section 0 define what it needs.
+
+The files have to survive for this to work. On Kaggle, `/kaggle/working` is kept between sessions
+only with **Settings → Persistence → Files** turned on. Otherwise, save a version, attach its
+output to the next session (**+ Add Data → Your Work**), and Section 0.5b copies it back in.
 """)
 
 # ---------------------------------------------------------------------------------------- setup
@@ -314,15 +324,72 @@ print("All dataset files found.")
 """)
 
 md("""\
-### 0.6 Load the pipeline modules
+### 0.5b Restore a previous run's files (optional)
+
+If a previous session's `/kaggle/working` didn't survive, attach that run's saved output
+(**+ Add Data → Your Work →** this notebook). This cell finds its
+`azlaya/student_resource/{data_processed,models,output}` and copies back any file that isn't
+already here, so Section 0.6 sees those steps as done. With nothing attached it does nothing.
+""")
+
+code("""\
+from pathlib import Path
+
+RESTORE_FROM_INPUT = True
+
+
+def find_previous_run(root="/kaggle/input"):
+    if not os.path.isdir(root):
+        return None
+    for p in sorted(Path(root).glob("**/azlaya/student_resource")):
+        if (p / "data_processed").is_dir() or (p / "models").is_dir():
+            return p
+    return None
+
+
+_prev = find_previous_run() if RESTORE_FROM_INPUT else None
+if _prev is None:
+    print("No previous run attached -- nothing to restore (normal for a first run, or when "
+          "/kaggle/working persisted).")
+else:
+    _copied = _skipped = 0
+    for _sub in ("data_processed", "models", "output"):
+        for _f in sorted((_prev / _sub).rglob("*")) if (_prev / _sub).is_dir() else []:
+            # skip half-written files/dirs (<name>.tmp) and the transient checkpoint backup (.old)
+            if not _f.is_file() or any(p.endswith((".tmp", ".old")) for p in _f.relative_to(_prev).parts):
+                continue
+            _dst = Path(STUDENT_RESOURCE_DIR) / _sub / _f.relative_to(_prev / _sub)
+            if _dst.exists():
+                _skipped += 1
+                continue
+            _dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_f, _dst)
+            _copied += 1
+    print(f"Restored {_copied} file(s) from {_prev} ({_skipped} already present, left untouched).")
+""")
+
+md("""\
+### 0.6 Load the pipeline modules + run settings
 
 Steps run **in this kernel** (not as `!python` subprocesses) so progress bars are live. Re-running
 this cell reloads `src/` from disk.
+
+**Run settings** (edit here):
+
+- `RESUME = True` skips every step whose output already exists, and continues Laya from its
+  checkpoint. Set it to `False` to recompute everything, e.g. after changing a step's code or
+  settings: its old output would otherwise be reused.
+- `LAYA_EPOCHS`: epochs per checkpoint. `multilingual` defaults to 2. The Router only sends it
+  records with non-Latin names (~4% of fine-tuning pairs in this data), yet it trains on all pairs,
+  so 4 epochs would cost as much GPU time as `english` for a small share of predictions.
+- `LAYA_TIME_BUDGET_HOURS`: Section 5b stops cleanly (checkpoint saved) after this long, which
+  leaves time in a 12-hour Kaggle GPU session for Sections 6-9. Re-run to continue.
 """)
 
 code("""\
 import gc
 import importlib
+import json
 import sys
 from pathlib import Path
 
@@ -385,6 +452,52 @@ def run_streaming(cmd):
 
 
 print("modules loaded | CPU cores:", os.cpu_count())
+
+# ---------------------------------------------------------------- run settings
+RESUME = True
+LAYA_EPOCHS = {"english": 4, "multilingual": 2}
+LAYA_TIME_BUDGET_HOURS = 7.0
+CHECKPOINT_EVERY_UPDATES = 200
+
+MODELS = ROOT / "models"
+STEP_OUTPUTS = {
+    "1. normalize": [DP / f"{s}_{k}_normalized.tsv" for s in ("train", "test")
+                     for k in ("source1", "source2", "source3")],
+    "2. blocking": [DP / "candidate_pairs_train.tsv"],
+    "3. features": [DP / "features_train.parquet"],
+    "4. GBDT": [MODELS / "gbdt_model.txt", DP / "gbdt_val_report.json"],
+    "5a. Laya datasets": [DP / f"laya_{r}_{p}.jsonl" for r in ("english", "multilingual")
+                          for p in ("train", "calib")],
+    "6. ensemble": [MODELS / "ensemble_config.json", DP / "ensemble_val_report.json"],
+}
+
+
+def step_done(step):
+    return RESUME and all(p.exists() for p in STEP_OUTPUTS[step])
+
+
+def skip_note(step):
+    print(f"RESUME: '{step}' output already exists -- skipped. (Set RESUME = False in 0.6 to redo it.)")
+
+
+def prediction_status():
+    marker = DP / "prediction_done.json"
+    return json.loads(marker.read_text()) if marker.exists() else None
+
+
+def print_pipeline_status():
+    print("Pipeline status" + ("" if RESUME else "  (RESUME = False: every step will re-run)"))
+    for step, paths in STEP_OUTPUTS.items():
+        if step == "6. ensemble":
+            for role in laya_finetune.ROLES:
+                print(f"  5b. Laya {role:13s} {laya_finetune.checkpoint_status(ROOT, role, LAYA_EPOCHS[role])}")
+        missing = [p.name for p in paths if not p.exists()]
+        print(f"  {step:22s} {'done' if not missing else 'to do' + (f' (missing: {missing[0]})' if len(missing) < len(paths) else '')}")
+    pred = prediction_status()
+    print(f"  {'7. test predictions':22s} " + (f"done with '{pred['stack_model']}'" if pred else "to do"))
+
+
+print_pipeline_status()
 """)
 
 # ------------------------------------------------------------------------------------ section 1
@@ -392,16 +505,13 @@ md("""\
 ## 1. Normalize
 
 Cleans names and addresses in all six source files (legal suffixes, DBA splitting, pin/postal
-code, city guess, script detection), in parallel across every CPU core.
-
-Set `SKIP_EXISTING = True` to reuse normalized files from a previous session. Only do this if
-they were written by the current `normalize.py`; otherwise leave it `False`.
+code, city guess, script detection), in parallel across every CPU core. With `RESUME`, files
+already normalized are reused one by one.
 """)
 
 code("""\
 reload_pipeline()
-SKIP_EXISTING = False
-normalize.run(ROOT, ["train", "test"], skip_existing=SKIP_EXISTING)
+normalize.run(ROOT, ["train", "test"], skip_existing=RESUME)
 free_memory()
 """)
 
@@ -429,9 +539,12 @@ pool, so hard negatives stay realistic. The test set is always blocked in full (
 code("""\
 reload_pipeline()
 MAX_TRAIN_S1 = 300_000
-blocking.run(ROOT, "train", k=30, out_path=DP / "candidate_pairs_train.tsv", report_recall=True,
-             val_frac=0.2, seed=42, max_s1=MAX_TRAIN_S1)
-free_memory()
+if step_done("2. blocking"):
+    skip_note("2. blocking")
+else:
+    blocking.run(ROOT, "train", k=30, out_path=DP / "candidate_pairs_train.tsv", report_recall=True,
+                 val_frac=0.2, seed=42, max_s1=MAX_TRAIN_S1)
+    free_memory()
 """)
 
 # ------------------------------------------------------------------------------------ section 3
@@ -443,12 +556,17 @@ DBA-aware name match. Computed in chunks for every candidate pair.
 """)
 
 code("""\
+import pyarrow.parquet as pq
+
 reload_pipeline()
-features.run(ROOT, "train", DP / "candidate_pairs_train.tsv", None)
-free_memory()
-feat = pd.read_parquet(DP / "features_train.parquet")
-print(feat.shape)
-feat.head()
+if step_done("3. features"):
+    skip_note("3. features")
+else:
+    features.run(ROOT, "train", DP / "candidate_pairs_train.tsv", None)
+    free_memory()
+_pf = pq.ParquetFile(DP / "features_train.parquet")   # peek without loading all rows into memory
+print(f"features_train.parquet: {_pf.metadata.num_rows:,} rows x {_pf.metadata.num_columns} columns")
+_pf.read_row_group(0).to_pandas().head()
 """)
 
 # ------------------------------------------------------------------------------------ section 4
@@ -460,12 +578,54 @@ training. Reports precision / recall / macro F_0.5 on the held-out entities.
 """)
 
 code("""\
-import json
 reload_pipeline()
-_ = train_gbdt.train(ROOT, DP / "features_train.parquet", val_frac=0.2, seed=42,
-                     num_boost_round=2000, early_stopping_rounds=50)
-free_memory()
+if step_done("4. GBDT"):
+    skip_note("4. GBDT")
+else:
+    _ = train_gbdt.train(ROOT, DP / "features_train.parquet", val_frac=0.2, seed=42,
+                         num_boost_round=2000, early_stopping_rounds=50)
+    free_memory()
 print(json.dumps(json.load(open(DP / "gbdt_val_report.json")), indent=2))
+""")
+
+md("""\
+### 4b. Safety submission: GBDT only (optional, recommended)
+
+Laya fine-tuning takes many GPU hours, and a session can end before it's done. This produces a
+**complete, valid submission from the GBDT alone** now, and keeps a copy in
+`output_gbdt_only/` and `submission_gbdt_only.zip`. Nothing here is wasted: the test-set
+blocking and features it computes (the slow CPU part of Section 7) are cached and reused by
+Section 7. Skipped when a submission already exists.
+""")
+
+code("""\
+import shutil
+
+MAKE_SAFETY_SUBMISSION = True
+
+reload_pipeline()
+if not MAKE_SAFETY_SUBMISSION:
+    print("MAKE_SAFETY_SUBMISSION = False -- skipped.")
+elif RESUME and prediction_status() is not None:
+    print(f"RESUME: a submission already exists (made with '{prediction_status()['stack_model']}') -- skipped.")
+else:
+    predict.run(ROOT, k=30, stack_model="gbdt_only", laya_batch_size=ensemble.LAYA_BATCH_SIZE,
+                threshold_override=None)
+    free_memory()
+    _safe = ROOT / "output_gbdt_only"
+    shutil.rmtree(_safe, ignore_errors=True)
+    shutil.copytree(ROOT / "output", _safe)
+    _r = subprocess.run([sys.executable, "utils/validate_submission.py", "--matching", "output/matching_results.tsv",
+                         "--candidate", "output/candidate_pairs.tsv", "--test-dir", "dataset/test"],
+                        cwd=STUDENT_RESOURCE_DIR, capture_output=True, text=True)
+    print(_r.stdout[-3000:], _r.stderr[-3000:])
+    _stage = Path(WORKDIR) / "submission_gbdt_only_package"
+    shutil.rmtree(_stage, ignore_errors=True)
+    shutil.copytree(_safe, _stage / "output")
+    shutil.copytree(PIPELINE_DIR, _stage / "code/business_entity_resolution",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy(ROOT / "Documentation_template.md", _stage / "Documentation_template.md")
+    print("Safety submission:", shutil.make_archive(f"{WORKDIR}/submission_gbdt_only", "zip", _stage))
 """)
 
 # ------------------------------------------------------------------------------------ section 5
@@ -475,8 +635,9 @@ md("""\
 Two checkpoints fine-tuned with Laya's RLCD recipe: `english` on Latin-script pairs,
 `multilingual` on all pairs (covers Devanagari/Tamil). Examples come from `MAX_FINETUNE_ENTITIES`
 training entities: all their true matches, plus up to 3 hard negatives each, in both orderings.
-The default of 6000 entities takes roughly an hour per checkpoint on T4 x2; raise it if you have
-GPU time.
+The default of 6000 entities (~66-69k examples) takes **hours per epoch** on T4 x2; a 4-epoch
+`english` run did not finish in one overnight session. That's why 5b is resumable and
+time-budgeted, and why 4b makes a GBDT-only safety submission first.
 
 ### 5a. Build the fine-tuning datasets (CPU)
 """)
@@ -484,9 +645,12 @@ GPU time.
 code("""\
 reload_pipeline()
 MAX_FINETUNE_ENTITIES = 6000
-laya_finetune.stage_prepare(ROOT, None, val_frac=0.2, calib_frac=0.15, seed=42,
-                            max_negatives_per_entity=3, max_finetune_entities=MAX_FINETUNE_ENTITIES)
-free_memory()
+if step_done("5a. Laya datasets"):
+    skip_note("5a. Laya datasets")
+else:
+    laya_finetune.stage_prepare(ROOT, None, val_frac=0.2, calib_frac=0.15, seed=42,
+                                max_negatives_per_entity=3, max_finetune_entities=MAX_FINETUNE_ENTITIES)
+    free_memory()
 with open(DP / "laya_english_train.jsonl") as f:
     print(json.dumps(json.loads(next(f)), indent=2))
 """)
@@ -495,14 +659,21 @@ md("""\
 ### 5b. Fine-tune both checkpoints
 
 With 2+ GPUs this runs `torchrun` DDP across all of them, streaming output live. DDP needs
-separate processes, so this step can't run in-kernel. With one GPU it runs in-kernel. Each
-role saves a rolling `models/laya_<role>/checkpoint_latest/` after every epoch.
+separate processes, so this step can't run in-kernel. With one GPU it runs in-kernel.
+
+**Resumable.** Each role saves `models/laya_<role>/checkpoint_latest/` every
+`CHECKPOINT_EVERY_UPDATES` optimizer updates and at each epoch end. Re-running this cell continues
+from there (same batch order, LR schedule fast-forwarded), skips a role that's already finished,
+and stops cleanly after `LAYA_TIME_BUDGET_HOURS` (both set in 0.6). A role is finished once
+`models/laya_<role>/rl_agent_config.json` exists. Until both are, Sections 6-7 fall back to the
+base (not fine-tuned) checkpoint for the missing one, with a warning.
 
 Fine-tuning uses the `%%writefile` version of `src/laya_finetune.py` on disk, so re-run its cell
 in 0.3 first if you edited it.
 """)
 
 code("""\
+import time
 import torch
 
 reload_pipeline()
@@ -511,15 +682,34 @@ print(f"visible GPUs: {N_GPUS}", [torch.cuda.get_device_name(i) for i in range(N
 if N_GPUS == 0:
     raise RuntimeError("No GPU visible -- turn on an accelerator (Kaggle: Settings -> Accelerator) before Section 5.")
 
+_t_start = time.time()
 for role in ("english", "multilingual"):
-    print(f"\\n========== fine-tuning {role} ==========")
+    print(f"\\n========== {role}: {laya_finetune.checkpoint_status(ROOT, role, LAYA_EPOCHS[role])} ==========")
+    if RESUME and laya_finetune.role_is_done(ROOT, role):
+        continue
+    hours_left = LAYA_TIME_BUDGET_HOURS - (time.time() - _t_start) / 3600
+    if hours_left < 0.25:
+        print(f"Time budget ({LAYA_TIME_BUDGET_HOURS}h) used up -- re-run this cell to continue with {role}.")
+        break
     if N_GPUS >= 2:
         run_streaming(["torchrun", "--standalone", f"--nproc_per_node={N_GPUS}",
-                       "-m", "src.laya_finetune", "--stage", "train", "--role", role])
+                       "-m", "src.laya_finetune", "--stage", "train", "--role", role,
+                       "--epochs", str(LAYA_EPOCHS[role]),
+                       "--checkpoint-every-updates", str(CHECKPOINT_EVERY_UPDATES),
+                       "--max-hours", f"{hours_left:.3f}"] + ([] if RESUME else ["--no-resume"]))
     else:
-        laya_finetune.stage_train(ROOT, role, epochs=4, micro_batch=8, grad_accum=4,
-                                  lr_encoder=2.5e-5, lr_head=1.0e-4, calib_max=400, seed=42)
+        laya_finetune.stage_train(ROOT, role, epochs=LAYA_EPOCHS[role], micro_batch=8, grad_accum=4,
+                                  lr_encoder=2.5e-5, lr_head=1.0e-4, calib_max=400, seed=42,
+                                  resume=RESUME, checkpoint_every_updates=CHECKPOINT_EVERY_UPDATES,
+                                  max_hours=hours_left)
     free_memory()
+    if not laya_finetune.role_is_done(ROOT, role):
+        print(f"\\n{role} is paused ({laya_finetune.checkpoint_status(ROOT, role, LAYA_EPOCHS[role])}). "
+              f"Re-run this cell to continue -- in this session, or in a new one with the files kept.")
+        break
+
+print()
+print_pipeline_status()
 """)
 
 # ------------------------------------------------------------------------------------ section 6
@@ -539,11 +729,18 @@ the same entities, broken down by country and singleton status.
 code("""\
 reload_pipeline()
 MAX_STACK_ENTITIES = 60_000
-free_memory()
-ensemble.run(ROOT, DP / "features_train.parquet", val_frac=0.2, seed=42,
-             laya_batch_size=ensemble.LAYA_BATCH_SIZE, laya_top_n=ensemble.LAYA_TOP_N,
-             laya_min_gbdt_prob=ensemble.LAYA_MIN_GBDT_PROB, max_entities=MAX_STACK_ENTITIES)
-free_memory()
+_unfinished = [r for r in laya_finetune.ROLES if not laya_finetune.role_is_done(ROOT, r)]
+if _unfinished:
+    print(f"WARNING: Laya {_unfinished} not fine-tuned yet (Section 5b) -- the base checkpoint is used for "
+          f"{'it' if len(_unfinished) == 1 else 'them'}. Finish 5b first unless you're out of GPU time.")
+if step_done("6. ensemble"):
+    skip_note("6. ensemble")
+else:
+    free_memory()
+    ensemble.run(ROOT, DP / "features_train.parquet", val_frac=0.2, seed=42,
+                 laya_batch_size=ensemble.LAYA_BATCH_SIZE, laya_top_n=ensemble.LAYA_TOP_N,
+                 laya_min_gbdt_prob=ensemble.LAYA_MIN_GBDT_PROB, max_entities=MAX_STACK_ENTITIES)
+    free_memory()
 """)
 
 code("""\
@@ -566,15 +763,20 @@ md("""\
 
 Blocks **every** test S1 entity, then runs features, GBDT, Laya (unless `BEST_MODEL` is
 `gbdt_only`) and the ensemble with its threshold. Writes `output/candidate_pairs.tsv` and
-`output/matching_results.tsv`.
+`output/matching_results.tsv`. If Section 4b already blocked the test set and computed its
+features, those are reused, and only the scoring runs.
 """)
 
 code("""\
 reload_pipeline()
-free_memory()
-predict.run(ROOT, k=30, stack_model=BEST_MODEL, laya_batch_size=ensemble.LAYA_BATCH_SIZE,
-            threshold_override=None)
-free_memory()
+_pred = prediction_status()
+if RESUME and _pred is not None and _pred["stack_model"] == BEST_MODEL:
+    print(f"RESUME: output/ already holds predictions from '{BEST_MODEL}' -- skipped.")
+else:
+    free_memory()
+    predict.run(ROOT, k=30, stack_model=BEST_MODEL, laya_batch_size=ensemble.LAYA_BATCH_SIZE,
+                threshold_override=None)
+    free_memory()
 """)
 
 # ------------------------------------------------------------------------------------ section 8

@@ -191,7 +191,7 @@ def run(repo_root, split: str, candidates_path, out_path):
     features_df = compute_features(pairs_df, table)
 
     out_path = out_path or (common.data_processed_dir(repo_root) / f"features_{split}.parquet")
-    features_df.to_parquet(out_path, index=False)
+    common.write_parquet_atomic(features_df, out_path)
     print(f"[features] wrote {out_path} ({len(features_df)} rows, {features_df.shape[1]} columns)")
 
 

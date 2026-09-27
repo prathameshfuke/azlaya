@@ -40,10 +40,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
+import shutil
+import warnings
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 from tqdm.auto import tqdm
 
@@ -130,9 +133,11 @@ def route_by_script(examples: List[dict]) -> Dict[str, List[dict]]:
 
 def write_jsonl(examples: List[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         for ex in examples:
             f.write(json.dumps({k: v for k, v in ex.items() if k != "meta"}, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
 
 
 def read_jsonl(path: Path) -> List[dict]:
@@ -271,8 +276,87 @@ def _fit_one_temp(sel):
     return float(torch.clamp(log_t.exp(), 0.1, 10.0).item())
 
 
+# ------------------------------------------------------------------------- checkpoints / resume
+#
+# A role is DONE when models/laya_<role>/rl_agent_config.json exists (written last, after the
+# calibrated weights). While training, models/laya_<role>/checkpoint_latest/ holds the newest
+# weights plus checkpoint_meta.json = {"epoch": completed epochs, "batches_done_in_epoch": batches
+# already trained in the next epoch, ...}. Checkpoints are written to a .tmp dir and swapped in,
+# so a kill mid-save never leaves a half-written checkpoint as the only copy.
+
+FINAL_MARKER = "rl_agent_config.json"
+
+
+def role_output_dir(repo_root: Path, role: str) -> Path:
+    return common.models_dir(repo_root) / f"laya_{role}"
+
+
+def role_is_done(repo_root: Path, role: str) -> bool:
+    return (role_output_dir(repo_root, role) / FINAL_MARKER).exists()
+
+
+def find_checkpoint(output_dir: Path) -> Optional[Path]:
+    for name in ("checkpoint_latest", "checkpoint_latest.old"):
+        d = Path(output_dir) / name
+        if (d / "checkpoint_meta.json").exists() and (d / "model.safetensors").exists():
+            return d
+    return None
+
+
+def read_resume_point(ckpt_dir: Path, epochs: int) -> Tuple[int, int, dict]:
+    """(start_epoch, batches_done_in_that_epoch, meta). Checkpoints written before mid-epoch
+    saving existed only carry "epoch", so they resume at the start of the next epoch."""
+    meta = json.loads((Path(ckpt_dir) / "checkpoint_meta.json").read_text())
+    start_epoch = int(meta.get("epoch", 0))
+    batches_done = int(meta.get("batches_done_in_epoch", 0))
+    if start_epoch >= epochs:
+        return epochs, 0, meta
+    return start_epoch, batches_done, meta
+
+
+def checkpoint_status(repo_root: Path, role: str, epochs: int) -> str:
+    """One-line, human-readable fine-tuning status for the notebook."""
+    if role_is_done(repo_root, role):
+        return "done (fine-tuned + calibrated)"
+    ckpt = find_checkpoint(role_output_dir(repo_root, role))
+    if ckpt is None:
+        return "not started"
+    start_epoch, batches_done, _ = read_resume_point(ckpt, epochs)
+    if start_epoch >= epochs:
+        return f"all {epochs} epochs trained; calibration + final save still to do"
+    return (f"resumable: {start_epoch}/{epochs} epochs complete"
+            + (f" + {batches_done} batches into epoch {start_epoch + 1}" if batches_done else ""))
+
+
+def _save_checkpoint(model, tok, output_dir: Path, meta: dict) -> None:
+    from safetensors.torch import save_file
+
+    output_dir = Path(output_dir)
+    tmp, final, old = (output_dir / "checkpoint_latest.tmp", output_dir / "checkpoint_latest",
+                       output_dir / "checkpoint_latest.old")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    # Only floating-point tensors go to fp16; integer buffers keep their dtype, so the checkpoint
+    # round-trips exactly into the training model on resume.
+    sd = {k: (v.half() if v.is_floating_point() else v).contiguous().cpu() for k, v in model.state_dict().items()}
+    save_file(sd, str(tmp / "model.safetensors"))
+    model.encoder.config.save_pretrained(str(tmp / "encoder"))
+    tok.save_pretrained(str(tmp / "tokenizer"))
+    (tmp / "checkpoint_meta.json").write_text(json.dumps(meta, indent=2))
+    shutil.rmtree(old, ignore_errors=True)
+    if final.exists():
+        os.replace(final, old)
+    os.replace(tmp, final)
+    shutil.rmtree(old, ignore_errors=True)
+
+
 def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_accum: int,
-                 lr_encoder: float, lr_head: float, calib_max: int, seed: int):
+                 lr_encoder: float, lr_head: float, calib_max: int, seed: int, resume: bool = True,
+                 checkpoint_every_updates: int = 200, max_hours: Optional[float] = None) -> str:
+    """Returns "done", "paused" (time budget reached; re-run to continue) or "skipped" (already
+    fine-tuned). resume=True continues from models/laya_<role>/checkpoint_latest when present,
+    including mid-epoch; a checkpoint is saved every `checkpoint_every_updates` optimizer updates
+    and at every epoch end. max_hours stops cleanly (after saving) once exceeded."""
     import time
     import torch
     import torch.distributed as dist
@@ -282,6 +366,13 @@ def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_
     from huggingface_hub import snapshot_download
     from laya.agent import _fix_tokenizer_config
     from laya.common import build_model, proper_reward, QTYPES
+
+    output_dir = role_output_dir(repo_root, role)
+    if resume and role_is_done(repo_root, role):
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"[laya_finetune/train] {role}: already fine-tuned ({output_dir / FINAL_MARKER} "
+                  f"exists) -- skipping. Pass resume=False / --no-resume to retrain from scratch.")
+        return "skipped"
 
     ddp_mode = "WORLD_SIZE" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
     if ddp_mode:
@@ -331,9 +422,38 @@ def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_
         random.Random(seed).shuffle(calib_items)
         calib_items = calib_items[:calib_max]
 
-    my_items = train_items[rank::world_size]
+    # Equal-length shards: under DDP every rank must run the same number of batches, or the
+    # longer rank blocks forever in its last all-reduce.
+    n_per_rank = len(train_items) // world_size
+    my_items = train_items[rank::world_size][:n_per_rank]
+
+    start_epoch, batches_done = 0, 0
+    weights_path = os.path.join(model_dir, "model.safetensors")
+    ckpt = find_checkpoint(output_dir) if resume else None
+    if ckpt is not None:
+        start_epoch, batches_done, meta = read_resume_point(ckpt, epochs)
+        if meta.get("n_train_items") not in (None, len(train_items)):
+            if rank == 0:
+                print(f"[laya_finetune/train] WARNING: {ckpt} was trained on {meta['n_train_items']} items "
+                      f"but the current dataset has {len(train_items)} (Section 5a was re-run with "
+                      f"different settings) -- ignoring it and starting from the base checkpoint.")
+            start_epoch, batches_done = 0, 0
+        else:
+            weights_path = str(ckpt / "model.safetensors")
+            same_layout = all(meta.get(k) in (None, v) for k, v in
+                              (("micro_batch", micro_batch), ("grad_accum", grad_accum), ("world_size", world_size)))
+            if batches_done and not same_layout:
+                # A mid-epoch position is only meaningful with the same batching and GPU count.
+                if rank == 0:
+                    print("[laya_finetune/train] batch size / grad-accum / GPU count changed since the "
+                          "checkpoint -- keeping its weights but restarting that epoch from its first batch.")
+                batches_done = 0
+            if rank == 0:
+                print(f"[laya_finetune/train] RESUMING {role} from {ckpt}: {start_epoch}/{epochs} epochs "
+                      f"complete" + (f" + {batches_done} batches into epoch {start_epoch + 1}" if batches_done else ""))
+
     model = build_model(cfg, encoder_dir=os.path.join(model_dir, "encoder"))
-    weights = load_file(os.path.join(model_dir, "model.safetensors"))
+    weights = load_file(weights_path)
     model.load_state_dict(weights, strict=True)
     model.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.head_checkpointing = True
@@ -349,26 +469,61 @@ def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_
         [{"params": enc_params, "lr": lr_encoder}, {"params": head_params, "lr": lr_head}],
         weight_decay=0.01,
     )
-    total_updates = max(1, (len(my_items) // (micro_batch * grad_accum)) * epochs)
+    n_batches_per_epoch = math.ceil(len(my_items) / micro_batch)
+    updates_per_epoch = math.ceil(n_batches_per_epoch / grad_accum)
+    total_updates = max(1, updates_per_epoch * epochs)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_updates, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-    output_dir = common.models_dir(repo_root) / f"laya_{role}"
+    # Resume: fast-forward the LR schedule to where the interrupted run was, and replay the
+    # per-epoch in-place shuffles so the resumed epoch sees exactly the same batch order (the
+    # already-trained batches are then skipped). AdamW's moment estimates aren't checkpointed, so
+    # they restart from zero -- a brief, harmless re-warm-up.
+    updates_done = start_epoch * updates_per_epoch + batches_done // grad_accum
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # "scheduler.step() before optimizer.step()"
+        for _ in range(updates_done):
+            scheduler.step()
+    for e in range(start_epoch):
+        random.seed(seed + e + rank)
+        random.shuffle(my_items)
+
     if rank == 0:
         print(f"[laya_finetune/train] {len(train_items)} usable train items "
               f"({len(calib_items)} held out for calibration) | {len(my_items)} on this rank | "
               f"{epochs} epochs -> {output_dir}")
+        if max_hours:
+            print(f"[laya_finetune/train] time budget {max_hours:.1f}h: stops cleanly (after saving a "
+                  f"checkpoint) once exceeded; re-run to continue.")
     t0 = time.time()
+    max_seconds = max_hours * 3600 if max_hours else None
 
-    for epoch in range(epochs):
+    def _should_stop() -> bool:
+        # Called at the same update count on every rank, so the all-reduce lines up; any rank
+        # over budget stops all of them together.
+        local = max_seconds is not None and (time.time() - t0) > max_seconds
+        if ddp_mode:
+            flag = torch.tensor([1 if local else 0], device=device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+            return bool(flag.item())
+        return local
+
+    def _ckpt_meta(completed_epochs: int, batches_in_next: int) -> dict:
+        return {"epoch": completed_epochs, "batches_done_in_epoch": batches_in_next,
+                "total_epochs": epochs, "updates_done": updates_done, "n_train_items": len(train_items),
+                "micro_batch": micro_batch, "grad_accum": grad_accum, "world_size": world_size}
+
+    paused = False
+    for epoch in range(start_epoch, epochs):
         random.seed(seed + epoch + rank)
         random.shuffle(my_items)
-        epoch_loss, n_batches, accum_step = 0.0, 0, 0
+        skip = batches_done if epoch == start_epoch else 0
+        epoch_loss, n_batches, accum_step = 0.0, 0, skip
         optimizer.zero_grad(set_to_none=True)
         sigma = sigma_start + (sigma_end - sigma_start) * (epoch / max(1, epochs - 1))
 
-        for b_idx in tqdm(range(0, len(my_items), micro_batch), desc=f"epoch {epoch + 1}/{epochs}",
-                          unit="batch", disable=quiet, mininterval=5.0):
+        for b_idx in tqdm(range(skip * micro_batch, len(my_items), micro_batch), desc=f"epoch {epoch + 1}/{epochs}",
+                          unit="batch", disable=quiet, mininterval=5.0, initial=skip, total=n_batches_per_epoch):
             chunk = my_items[b_idx:b_idx + micro_batch]
             if not chunk:
                 continue
@@ -402,13 +557,17 @@ def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_
 
             scaler.scale(loss).backward()
             accum_step += 1
-            if accum_step % grad_accum == 0 or (b_idx + micro_batch) >= len(my_items):
+            last_batch = (b_idx + micro_batch) >= len(my_items)
+            stepped = False
+            if accum_step % grad_accum == 0 or last_batch:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                updates_done += 1
+                stepped = True
 
             epoch_loss += loss.item() * grad_accum
             n_batches += 1
@@ -416,21 +575,38 @@ def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_
                 print(f"  epoch {epoch + 1}/{epochs} step {n_batches} loss={loss.item() * grad_accum:.4f} "
                       f"reward={r.mean().item():.3f} lr={scheduler.get_last_lr()[0]:.2e}")
 
+            # Mid-epoch checkpoint, only right after an optimizer update (no half-accumulated
+            # gradients are lost). The epoch-end checkpoint below covers the last batch.
+            if stepped and not last_batch and checkpoint_every_updates and updates_done % checkpoint_every_updates == 0:
+                if rank == 0:
+                    _save_checkpoint(model, tok, output_dir, _ckpt_meta(epoch, b_idx // micro_batch + 1))
+                if _should_stop():
+                    paused = True
+                    break
+
+        if paused:
+            break
         if rank == 0:
             print(f"=== epoch {epoch + 1}/{epochs} done in {time.time() - t0:.1f}s | "
                   f"avg loss {epoch_loss / max(1, n_batches):.4f} ===")
         if ddp_mode:
             dist.barrier()
         if rank == 0:
-            ckpt_dir = output_dir / "checkpoint_latest"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            ckpt_sd = {k: v.half().contiguous().cpu() for k, v in model.state_dict().items()}
-            save_file(ckpt_sd, str(ckpt_dir / "model.safetensors"))
-            model.encoder.config.save_pretrained(str(ckpt_dir / "encoder"))
-            tok.save_pretrained(str(ckpt_dir / "tokenizer"))
-            with open(ckpt_dir / "checkpoint_meta.json", "w") as f:
-                json.dump({"epoch": epoch + 1, "total_epochs": epochs,
-                           "avg_loss": epoch_loss / max(1, n_batches)}, f, indent=2)
+            _save_checkpoint(model, tok, output_dir, {**_ckpt_meta(epoch + 1, 0),
+                                                      "avg_loss": epoch_loss / max(1, n_batches)})
+        if epoch + 1 < epochs and _should_stop():
+            paused = True
+            break
+
+    if paused:
+        if ddp_mode:
+            dist.barrier()
+            dist.destroy_process_group()
+        if rank == 0:
+            print(f"\n[laya_finetune/train] PAUSED {role}: time budget of {max_hours}h reached after "
+                  f"{(time.time() - t0) / 3600:.2f}h. Progress is saved in {output_dir / 'checkpoint_latest'} "
+                  f"-- re-run the same step to continue from there.")
+        return "paused"
 
     if ddp_mode:
         dist.barrier()
@@ -486,6 +662,7 @@ def stage_train(repo_root: Path, role: str, epochs: int, micro_batch: int, grad_
 
     if ddp_mode:
         dist.destroy_process_group()
+    return "done"
 
 
 # ---------------------------------------------------------------------------------- Router glue
@@ -523,12 +700,15 @@ def build_router(repo_root: Path, device: str = None):
 
     models = {}
     for role in ROLES:
-        local_dir = common.models_dir(repo_root) / f"laya_{role}"
-        if local_dir.exists():
+        local_dir = role_output_dir(repo_root, role)
+        # The final marker, not just the directory: models/laya_<role>/ also exists while a
+        # fine-tune is only partway done (it holds checkpoint_latest/), and that isn't loadable.
+        if role_is_done(repo_root, role):
             models[role] = str(local_dir)
         else:
-            print(f"[laya_finetune] WARNING: no fine-tuned '{role}' checkpoint at {local_dir}; "
-                  f"falling back to the base '{BASE_CHECKPOINTS[role]}' checkpoint (zero-shot).")
+            print(f"[laya_finetune] WARNING: no finished fine-tuned '{role}' checkpoint at {local_dir} "
+                  f"({checkpoint_status(repo_root, role, epochs=4)}); falling back to the base "
+                  f"'{BASE_CHECKPOINTS[role]}' checkpoint (zero-shot).")
             models[role] = BASE_CHECKPOINTS[role]
     return Router(models=models, device=device, preload=True)
 
@@ -561,6 +741,14 @@ def main():
     parser.add_argument("--lr-head", type=float, default=1.0e-4)
     parser.add_argument("--calib-max", type=int, default=400)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-resume", action="store_true",
+                        help="[train] Ignore models/laya_<role>/checkpoint_latest and any finished "
+                             "checkpoint; retrain from the base model.")
+    parser.add_argument("--checkpoint-every-updates", type=int, default=200,
+                        help="[train] Save a resumable checkpoint every N optimizer updates (0 = epoch ends only).")
+    parser.add_argument("--max-hours", type=float, default=None,
+                        help="[train] Stop cleanly (after saving) once this many hours have passed; "
+                             "re-run to continue.")
     args = parser.parse_args()
 
     if args.stage == "prepare":
@@ -569,8 +757,12 @@ def main():
     else:
         if not args.role:
             raise SystemExit("--stage train requires --role {english,multilingual}")
-        stage_train(args.repo_root, args.role, args.epochs, args.micro_batch, args.grad_accum,
-                    args.lr_encoder, args.lr_head, args.calib_max, args.seed)
+        status = stage_train(args.repo_root, args.role, args.epochs, args.micro_batch, args.grad_accum,
+                             args.lr_encoder, args.lr_head, args.calib_max, args.seed,
+                             resume=not args.no_resume, checkpoint_every_updates=args.checkpoint_every_updates,
+                             max_hours=args.max_hours)
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"[laya_finetune/train] {args.role}: {status}")
 
 
 if __name__ == "__main__":
